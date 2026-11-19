@@ -1,5 +1,5 @@
 //! HTTP surface: `/healthz` (unauthenticated, ok/stale only) and the authenticated
-//! MCP endpoint at `/mcp`. OAuth routes join in Phase 2b.
+//! MCP endpoint at `/mcp`, plus the OAuth endpoints when an owner passphrase is configured.
 
 use std::{sync::Arc, time::Duration};
 
@@ -31,6 +31,8 @@ pub struct AppState {
     pub validators: Vec<Arc<dyn TokenValidator>>,
     /// Cancelled on shutdown so MCP streams end.
     pub shutdown: CancellationToken,
+    /// The OAuth authorization server; `None` disables its endpoints (API keys only).
+    pub oauth: Option<crate::oauth::OAuthState>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -38,21 +40,36 @@ pub fn router(state: AppState) -> Router {
         .expect("building the MCP HTTP client");
     let mcp_svc = mcp::service(deps, state.shutdown.child_token());
     let auth_state = AuthState::new(state.validators.clone(), &state.config.public_url);
+    // `route_layer`: only matched `/mcp` requests pass through auth; unknown paths stay 404.
     let mcp_routes = Router::new()
         .nest_service("/mcp", mcp_svc)
-        .layer(middleware::from_fn_with_state(
+        .route_layer(middleware::from_fn_with_state(
             auth_state,
             auth::require_auth,
         ))
-        .layer(TimeoutLayer::with_status_code(
+        .route_layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
             REQUEST_TIMEOUT,
         ))
-        .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES));
-    Router::new()
+        .route_layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES));
+    let mut app = Router::new()
         .route("/healthz", get(healthz))
-        .with_state(state)
-        .merge(mcp_routes)
+        .with_state(state.clone())
+        .merge(mcp_routes);
+    if let Some(o) = state.oauth.clone() {
+        app = app.merge(
+            crate::oauth::routes(o)
+                .layer(TimeoutLayer::with_status_code(
+                    StatusCode::REQUEST_TIMEOUT,
+                    Duration::from_secs(20),
+                ))
+                .layer(RequestBodyLimitLayer::new(32 * 1024)),
+        );
+    }
+    app.layer(middleware::from_fn_with_state(
+        Arc::new(state.config.trusted_proxies.clone()),
+        auth::client_ip_layer,
+    ))
 }
 
 /// `{"status":"ok"}`, `{"status":"stale"}` (a core source is out of date; still 200)
@@ -77,7 +94,7 @@ async fn healthz(State(s): State<AppState>) -> (StatusCode, Json<Value>) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use axum::{body::Body, http::Request};
     use tower::ServiceExt;
@@ -99,6 +116,7 @@ mod tests {
             syncer,
             validators: vec![],
             shutdown: CancellationToken::new(),
+            oauth: None,
         }
     }
 
@@ -269,8 +287,11 @@ mod tests {
             let (st, h, _) = send(&app, post(key, &body)).await;
             assert_eq!(st, StatusCode::UNAUTHORIZED);
             let www = h["www-authenticate"].to_str().unwrap();
-            assert!(www.starts_with("Bearer resource_metadata=\""), "{www}");
-            assert!(www.contains("/.well-known/oauth-protected-resource"));
+            assert!(www.starts_with("Bearer "), "{www}");
+            assert!(www.contains(
+                "resource_metadata=\"http://localhost:8080/.well-known/oauth-protected-resource\""
+            ));
+            assert_eq!(www.contains("invalid_token"), key.is_some(), "{www}");
         }
         // healthz needs no key
         let (st, _, _) = send(&app, Request::get("/healthz").body(Body::empty()).unwrap()).await;

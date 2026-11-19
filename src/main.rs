@@ -4,7 +4,7 @@
 //! subcommands run one operation against the configured database and exit (see
 //! `warden help`).
 
-// Some model/db helpers are only used by tests or by Phase 2b (OAuth).
+// Some model/db helpers are only used by tests.
 #![allow(dead_code)]
 
 mod auth;
@@ -14,6 +14,7 @@ mod http;
 mod mcp;
 mod model;
 mod monitors;
+mod oauth;
 
 use std::sync::Arc;
 
@@ -41,6 +42,7 @@ USAGE:
   warden feed [--consumer X] [--limit N] [--product P] [--min-cvss S] [--include-acked] [--ack]
                                      print what is new for a consumer (default `cli`); --ack consumes it
   warden cve <CVE-ID>                print the full record of one CVE
+  warden hash-passphrase             hash the owner passphrase for the OAuth consent page (reads stdin)
   warden hash-key [name]             generate an API key (printed once) and its WARDEN_API_KEYS entry
 
 Environment: see .env.example (WARDEN_DB_PATH, WARDEN_SYNC_INTERVAL, WARDEN_RETENTION_DAYS, ...).";
@@ -120,6 +122,11 @@ async fn main() -> Result<()> {
             "{}",
             auth::hash_key_command(args.positional.first().map(String::as_str))?
         );
+        return Ok(());
+    }
+
+    if cmd == "hash-passphrase" {
+        print!("{}", oauth::hash_passphrase_command()?);
         return Ok(());
     }
 
@@ -254,14 +261,32 @@ async fn serve(config: Arc<config::Config>, db: db::Db, syncer: Arc<Syncer>) -> 
             "WARDEN_API_KEYS is empty: every /mcp request will be rejected (run `warden hash-key`)"
         );
     }
+    let oauth = oauth::from_config(db.clone(), &config).context("OAuth setup")?;
+    let mut validators: Vec<Arc<dyn auth::TokenValidator>> = vec![Arc::new(keys)];
+    match &oauth {
+        Some(o) => {
+            validators.push(Arc::new(o.validator()));
+            tracing::info!(resource = %o.cfg.resource, "OAuth authorization server enabled");
+        }
+        None => tracing::info!(
+            "WARDEN_OWNER_PASSPHRASE_HASH is not set: OAuth endpoints are disabled, only API keys work"
+        ),
+    }
+    if !config.trusted_proxies.is_empty() {
+        tracing::info!(
+            count = config.trusted_proxies.len(),
+            "trusting forwarded client IPs from proxies"
+        );
+    }
     let shutdown = tokio_util::sync::CancellationToken::new();
     let scheduler = tokio::spawn(sync::run_scheduler(syncer.clone(), config.sync_interval));
     let app = http::router(http::AppState {
         db,
         config: config.clone(),
         syncer,
-        validators: vec![Arc::new(keys)],
+        validators,
         shutdown: shutdown.clone(),
+        oauth,
     });
     let listener = tokio::net::TcpListener::bind(config.bind)
         .await

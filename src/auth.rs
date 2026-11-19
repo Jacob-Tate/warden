@@ -13,7 +13,7 @@
 use std::{
     collections::HashMap,
     future::Future,
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     pin::Pin,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -191,6 +191,8 @@ pub struct AuthState {
     validators: Arc<Vec<Arc<dyn TokenValidator>>>,
     limiter: Arc<FailureLimiter>,
     challenge: HeaderValue,
+    /// Challenge for a request that did present a (bad) token (RFC 6750 `invalid_token`).
+    invalid_challenge: HeaderValue,
 }
 
 impl AuthState {
@@ -198,19 +200,29 @@ impl AuthState {
         let challenge = format!(
             "Bearer resource_metadata=\"{public_url}/.well-known/oauth-protected-resource\""
         );
+        let invalid = format!(
+            "Bearer error=\"invalid_token\", resource_metadata=\"{public_url}/.well-known/oauth-protected-resource\""
+        );
+        let hv = |s: &str| {
+            HeaderValue::from_str(s).unwrap_or_else(|_| HeaderValue::from_static("Bearer"))
+        };
         Self {
             validators: Arc::new(validators),
             limiter: Arc::new(FailureLimiter::default()),
-            challenge: HeaderValue::from_str(&challenge)
-                .unwrap_or_else(|_| HeaderValue::from_static("Bearer")),
+            challenge: hv(&challenge),
+            invalid_challenge: hv(&invalid),
         }
     }
 
-    fn unauthorized(&self) -> Response {
+    fn unauthorized(&self, token_presented: bool) -> Response {
         let mut r = Response::new(Body::from("unauthorized"));
         *r.status_mut() = StatusCode::UNAUTHORIZED;
-        r.headers_mut()
-            .insert(header::WWW_AUTHENTICATE, self.challenge.clone());
+        let ch = if token_presented {
+            &self.invalid_challenge
+        } else {
+            &self.challenge
+        };
+        r.headers_mut().insert(header::WWW_AUTHENTICATE, ch.clone());
         r
     }
 }
@@ -225,24 +237,20 @@ fn bearer(req: &Request) -> Option<&str> {
 }
 
 /// axum middleware (`from_fn_with_state`): authenticate or answer 401/429.
+///
+/// A valid token is always accepted, even from an address that is currently blocked:
+/// the limiter only throttles *failed* attempts (tokens are 256-bit random values, so
+/// letting a valid one through cannot help a guesser), so a flood of bad tokens from
+/// one address can never lock out a caller that holds a good credential.
 pub async fn require_auth(State(st): State<AuthState>, mut req: Request, next: Next) -> Response {
     let ip = req
         .extensions()
-        .get::<ConnectInfo<SocketAddr>>()
-        .map(|p| p.0.ip());
-    if let Some(ip) = ip
-        && st.limiter.blocked(ip)
-    {
-        let mut r = Response::new(Body::from("too many failed authentication attempts"));
-        *r.status_mut() = StatusCode::TOO_MANY_REQUESTS;
-        r.headers_mut().insert(
-            header::RETRY_AFTER,
-            HeaderValue::from(FAILURE_WINDOW.as_secs()),
-        );
-        return r;
-    }
+        .get::<ClientIp>()
+        .map(|c| c.0)
+        .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+    let token = bearer(&req).map(str::to_owned);
     let mut principal = None;
-    if let Some(token) = bearer(&req) {
+    if let Some(token) = &token {
         for v in st.validators.iter() {
             if let Some(p) = v.validate(token).await {
                 principal = Some(p);
@@ -256,12 +264,135 @@ pub async fn require_auth(State(st): State<AuthState>, mut req: Request, next: N
             next.run(req).await
         }
         None => {
-            if let Some(ip) = ip {
+            if st.limiter.blocked(ip) {
+                let mut r = Response::new(Body::from("too many failed authentication attempts"));
+                *r.status_mut() = StatusCode::TOO_MANY_REQUESTS;
+                r.headers_mut().insert(
+                    header::RETRY_AFTER,
+                    HeaderValue::from(FAILURE_WINDOW.as_secs()),
+                );
+                return r;
+            }
+            // A request with no credentials at all is the normal start of an OAuth
+            // handshake, not an attack: only count attempts that presented a token.
+            if token.is_some() {
                 st.limiter.record_failure(ip);
             }
-            st.unauthorized()
+            st.unauthorized(token.is_some())
         }
     }
+}
+
+// ---- client IP -----------------------------------------------------------------------
+
+/// The address a request is attributed to (see [`resolve_client_ip`]); set by [`client_ip_layer`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClientIp(pub IpAddr);
+
+fn parse_ip_token(raw: &str) -> Option<IpAddr> {
+    let t = raw.trim().trim_matches('"');
+    if let Ok(ip) = t.parse::<IpAddr>() {
+        return Some(ip);
+    }
+    if let Ok(sa) = t.parse::<SocketAddr>() {
+        return Some(sa.ip());
+    }
+    // `[v6]` without a port
+    t.strip_prefix('[')
+        .and_then(|r| r.strip_suffix(']'))
+        .and_then(|r| r.parse().ok())
+}
+
+fn is_trusted(ip: IpAddr, trusted: &[ipnet::IpNet]) -> bool {
+    // An IPv4-mapped IPv6 peer (dual-stack socket) is matched as its IPv4 address too.
+    let v4 = match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped(),
+        IpAddr::V4(_) => None,
+    };
+    trusted
+        .iter()
+        .any(|n| n.contains(&ip) || v4.is_some_and(|a| n.contains(&IpAddr::V4(a))))
+}
+
+/// Hops (client first, nearest proxy last) from `X-Forwarded-For`, else `Forwarded`
+/// (`for=`), else `X-Real-IP`. `None` entries are unparsable (`unknown`, obfuscated ids).
+fn forwarded_chain(headers: &axum::http::HeaderMap) -> Vec<Option<IpAddr>> {
+    let join = |name: &str| {
+        headers
+            .get_all(name)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect::<Vec<_>>()
+    };
+    let xff = join("x-forwarded-for");
+    if !xff.is_empty() {
+        return xff
+            .iter()
+            .flat_map(|v| v.split(','))
+            .map(parse_ip_token)
+            .collect();
+    }
+    let fwd = join("forwarded");
+    if !fwd.is_empty() {
+        return fwd
+            .iter()
+            .flat_map(|v| v.split(','))
+            .map(|elem| {
+                elem.split(';').find_map(|kv| {
+                    let (k, v) = kv.split_once('=')?;
+                    k.trim()
+                        .eq_ignore_ascii_case("for")
+                        .then(|| parse_ip_token(v))
+                        .flatten()
+                })
+            })
+            .collect();
+    }
+    join("x-real-ip")
+        .iter()
+        .map(|v| parse_ip_token(v))
+        .collect()
+}
+
+/// The client address for rate limiting. If the TCP `peer` is not a trusted proxy the
+/// peer itself is used and forwarding headers are ignored (they are attacker-controlled).
+/// If it is, the chain is walked from the right (nearest hop first) skipping trusted
+/// proxies; the first untrusted hop is the client. An unparsable hop in that position
+/// (or an all-trusted chain) falls back to the peer rather than trusting a spoofable value.
+pub fn resolve_client_ip(
+    peer: Option<IpAddr>,
+    headers: &axum::http::HeaderMap,
+    trusted: &[ipnet::IpNet],
+) -> IpAddr {
+    let Some(peer) = peer else {
+        return IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+    };
+    if trusted.is_empty() || !is_trusted(peer, trusted) {
+        return peer;
+    }
+    for hop in forwarded_chain(headers).into_iter().rev() {
+        match hop {
+            Some(ip) if is_trusted(ip, trusted) => continue,
+            Some(ip) => return ip,
+            None => return peer,
+        }
+    }
+    peer
+}
+
+/// Middleware: attach [`ClientIp`] to every request.
+pub async fn client_ip_layer(
+    State(trusted): State<Arc<Vec<ipnet::IpNet>>>,
+    mut req: Request,
+    next: Next,
+) -> Response {
+    let peer = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|p| p.0.ip());
+    let ip = resolve_client_ip(peer, req.headers(), &trusted);
+    req.extensions_mut().insert(ClientIp(ip));
+    next.run(req).await
 }
 
 #[cfg(test)]
@@ -306,6 +437,55 @@ mod tests {
         l.record_failure(ip);
         assert!(l.blocked(ip));
         assert!(!l.blocked("10.0.0.2".parse().unwrap()));
+    }
+
+    fn hm(pairs: &[(&str, &str)]) -> axum::http::HeaderMap {
+        let mut h = axum::http::HeaderMap::new();
+        for (k, v) in pairs {
+            h.append(
+                axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                v.parse().unwrap(),
+            );
+        }
+        h
+    }
+
+    #[test]
+    fn client_ip_resolution() {
+        let trusted = crate::config::parse_proxies("10.0.0.0/8, 172.16.0.5").unwrap();
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let r = |peer: &str, h: &axum::http::HeaderMap, t: &[ipnet::IpNet]| {
+            resolve_client_ip(Some(ip(peer)), h, t)
+        };
+        // untrusted peer: headers ignored (spoofing)
+        let h = hm(&[("x-forwarded-for", "1.2.3.4")]);
+        assert_eq!(r("203.0.113.7", &h, &trusted), ip("203.0.113.7"));
+        // trusted peer: right-most untrusted hop, not the spoofable left-most one
+        let h = hm(&[("x-forwarded-for", "9.9.9.9, 198.51.100.4, 10.1.1.1")]);
+        assert_eq!(r("10.0.0.2", &h, &trusted), ip("198.51.100.4"));
+        // multiple header lines, ip:port form
+        let h = hm(&[
+            ("x-forwarded-for", "9.9.9.9"),
+            ("x-forwarded-for", "198.51.100.4:5000, 172.16.0.5"),
+        ]);
+        assert_eq!(r("10.0.0.2", &h, &trusted), ip("198.51.100.4"));
+        // Forwarded and X-Real-IP
+        let h = hm(&[(
+            "forwarded",
+            "for=1.1.1.1, for=\"[2001:db8::1]:99\";proto=https",
+        )]);
+        assert_eq!(r("10.0.0.2", &h, &trusted), ip("2001:db8::1"));
+        let h = hm(&[("x-real-ip", "198.51.100.9")]);
+        assert_eq!(r("10.0.0.2", &h, &trusted), ip("198.51.100.9"));
+        // garbage / missing / all-trusted: fall back to the peer
+        let h = hm(&[("x-forwarded-for", "1.2.3.4, unknown")]);
+        assert_eq!(r("10.0.0.2", &h, &trusted), ip("10.0.0.2"));
+        assert_eq!(r("10.0.0.2", &hm(&[]), &trusted), ip("10.0.0.2"));
+        let h = hm(&[("x-forwarded-for", "10.5.5.5")]);
+        assert_eq!(r("10.0.0.2", &h, &trusted), ip("10.0.0.2"));
+        // no trusted proxies configured
+        let h = hm(&[("x-forwarded-for", "1.2.3.4")]);
+        assert_eq!(r("10.0.0.2", &h, &[]), ip("10.0.0.2"));
     }
 
     #[test]

@@ -1,4 +1,4 @@
-# warden architecture (Phase 2a)
+# warden architecture (Phase 2b)
 
 ## Module map
 
@@ -8,9 +8,10 @@
 | `db` | r2d2 pool (WAL, busy_timeout, foreign keys), `rusqlite_migration` migrations, `db::repo` functions (tracked products, per-source cursor/status). `Db::call` runs closures on the blocking pool. |
 | `model` | Shared types: `TrackedProduct`, `CveRecord`, `Cvss`, `KevEntry`, `EpssScore`, `Delivered`, `SourceStatus`, `FeedItem`, `FeedEnvelope`. |
 | `monitors::cve` | First monitor. `normalize`, `matcher`, `discovery`, `sources/{cvelist,nvd_feed,nvd_api,kev,epss}` (`Source` trait, typed cursors), `sync` (orchestration, scheduler, retention), `feed` (`get_new`, `ack`, `cve_detail`), `tracked` (add/update/remove/list helpers for MCP and the CLI). |
-| `http` | axum router: `/healthz` (unauthenticated; only `{"status":"ok"|"stale"}`, 503 `degraded` if the DB is down) and `/mcp` behind auth, a 1 MB body limit and a 120 s request timeout. |
+| `http` | axum router: `/healthz` (unauthenticated; plus the OAuth routes when enabled; only `{"status":"ok"|"stale"}`, 503 `degraded` if the DB is down) and `/mcp` behind auth, a 1 MB body limit and a 120 s request timeout. |
 | `mcp` | rmcp 3.11 server: stateless streamable HTTP with JSON responses, built per request by the service factory. |
-| `auth` | Bearer-token middleware, `TokenValidator` trait, API-key validator, failed-auth limiter, `hash-key`. OAuth AS arrives in Phase 2b. |
+| `auth` | Bearer-token middleware, `TokenValidator` trait, API-key validator, failed-auth limiter, client-IP resolution (`WARDEN_TRUSTED_PROXIES`), `hash-key`. |
+| `oauth` | Single-user OAuth 2.1 authorization server (metadata, DCR, authorize/consent, token, revoke), `OAuthValidator`, passphrase and registration limiters, `hash-passphrase`. |
 
 Future SSL/uptime monitors become siblings of `monitors::cve`. No shared plugin trait yet.
 
@@ -49,7 +50,7 @@ Discovery merges CPE rows with the same `vendor:product` across parts (`a`/`o`/`
 
 ## CLI
 
-`warden [serve]` (HTTP + scheduler), `hash-key [name]` (new API key + config line), `sync-once`, `discover <name>`, `track-add <name> [--pick N]`, `tracked`, `rematch`, `feed [--consumer X] [--limit N] [--product P] [--min-cvss S] [--include-acked] [--ack]`, `cve <id>`. Logs go to stderr; JSON results to stdout. Config comes from the environment (`.env.example`).
+`warden [serve]` (HTTP + scheduler), `hash-key [name]` (new API key + config line), `hash-passphrase` (owner passphrase hash from stdin), `sync-once`, `discover <name>`, `track-add <name> [--pick N]`, `tracked`, `rematch`, `feed [--consumer X] [--limit N] [--product P] [--min-cvss S] [--include-acked] [--ack]`, `cve <id>`. Logs go to stderr; JSON results to stdout. Config comes from the environment (`.env.example`).
 
 ## MCP server (`mcp`)
 
@@ -72,14 +73,45 @@ User mistakes (bad id, unknown product, rate limit, discovery timeout) are tool 
 ## Auth (`auth`)
 
 - `/mcp` needs `Authorization: Bearer <key>`. `WARDEN_API_KEYS` is a comma-separated list of `name:sha256hex` (no plaintext keys are accepted). `warden hash-key [name]` makes a random 32-byte key (base64url), prints it once and the config line. Validation hashes the presented token and compares against every entry in constant time (`subtle`).
-- Failure: `401` with `WWW-Authenticate: Bearer resource_metadata="<public_url>/.well-known/oauth-protected-resource"`. In-memory per-peer-IP limiter: 10 failures in 5 minutes -> `429` (+ `Retry-After`) for that IP; it uses the TCP peer address (behind a reverse proxy this is the proxy's address, so a flood of bad tokens can lock out everyone for 5 minutes; fix later by trusting a forwarded header from a known proxy).
-- `TokenValidator` (async `validate(&str) -> Option<Principal>`) is the extension point: `AppState.validators` is tried in order; Phase 2b adds an OAuth access-token validator beside `ApiKeyValidator`.
+- Failure: `401` with `WWW-Authenticate: Bearer resource_metadata="<public_url>/.well-known/oauth-protected-resource"`; when a token was presented but rejected the challenge also carries `error="invalid_token"`. Unknown paths stay 404 (auth is a `route_layer` on `/mcp`).
+- Failed-auth limiter: in-memory, per client IP, 10 failures in 5 minutes -> `429` (+ `Retry-After`). Only requests that present a bad token count; requests with no credentials do not, and a request with a valid token is always served, even from a blocked address (tokens are 256-bit random, so this gives a guesser nothing).
+- Client IP (`auth::resolve_client_ip`, set on every request by `client_ip_layer`): the TCP peer, unless the peer is inside `WARDEN_TRUSTED_PROXIES` (IPs/CIDRs). Then the hop chain from `X-Forwarded-For` (else `Forwarded`, else `X-Real-IP`) is walked from the right, skipping trusted proxies; the first untrusted hop is the client. An unparsable hop, or a chain made only of trusted hops, falls back to the peer (never to a spoofable left-most value). Headers from an untrusted peer are ignored.
+- `TokenValidator` (async `validate(&str) -> Option<Principal>`) is the extension point: `AppState.validators` is tried in order; `OAuthValidator` sits beside `ApiKeyValidator` when OAuth is enabled.
 - Principal -> consumer: the middleware puts `Principal{name}` in the request extensions; rmcp copies the HTTP `Parts` into the MCP request context, and `get_new_cves`/`ack` read it (`Extension<Parts>`) to default `consumer` to the key name (explicit `consumer` wins; fallback `default`). Separate keys therefore have separate ack cursors.
+
+## OAuth authorization server (`oauth`)
+
+Enabled only when `WARDEN_OWNER_PASSPHRASE_HASH` (argon2id PHC string, made by `warden hash-passphrase`) is set; otherwise the routes do not exist (404) and a startup log line says so. An invalid hash fails startup.
+
+| Endpoint | Notes |
+|---|---|
+| `GET /.well-known/oauth-protected-resource` (+ `/mcp` suffix) | RFC 9728: `resource` = `<public>/mcp`, `authorization_servers` = [`<public>`], `bearer_methods_supported`, `scopes_supported`. |
+| `GET /.well-known/oauth-authorization-server` (+ `openid-configuration` alias) | RFC 8414: issuer, authorize/token/register/revoke endpoints, `code`, `authorization_code`+`refresh_token`, `S256`, auth method `none`, `authorization_response_iss_parameter_supported` (RFC 9207). `client_id_metadata_document_supported` is omitted on purpose (CIMD would mean fetching client-supplied URLs). |
+| `POST /register` | RFC 7591 JSON. 1-5 `redirect_uris`, each https (or http on loopback) and in `WARDEN_OAUTH_REDIRECT_ALLOW`. Always a public client (`none`). Limits: 10/hour per IP, 100/hour global, 50 clients; when full, never-authorized clients are evicted oldest first (clients holding tokens are protected, so a registration flood cannot displace the owner); clients unused for 30 days are pruned. |
+| `GET /authorize` | Validates client, `redirect_uri` (exact; loopback ignores the port), `response_type=code`, PKCE `S256` (43-char challenge), `resource` (if sent, must equal `<public>/mcp`). Bad client/redirect: error page, never a redirect. Other errors redirect with `error`, `state`, `iss`. Renders a self-contained consent page (CSP, `X-Frame-Options: DENY`, no-store) showing client name and redirect host, a passphrase field and a connection-name field. |
+| `POST /authorize` | Double-submit CSRF cookie (`warden_csrf`, HttpOnly, SameSite=Strict) checked first; request re-validated; Deny redirects `access_denied`; passphrase checked (argon2 on the blocking pool); success stores a code and 302s to `redirect_uri?code&state&iss`. |
+| `POST /token` | form-encoded. `authorization_code` (PKCE, client, redirect, resource) and `refresh_token`. `Cache-Control: no-store`; errors are OAuth JSON (`invalid_request|invalid_client|invalid_grant|invalid_target|unsupported_grant_type`, HTTP 400). |
+| `POST /revoke` | RFC 7009; revokes the presented token's whole family; always 200. |
+
+Tokens and lifetimes: code 60 s, single use; access token 1 h; refresh token 30 days (`WARDEN_OAUTH_REFRESH_DAYS`), sliding (each rotation issues a fresh 30 days). All are 32 random bytes (base64url); only SHA-256 hashes are stored. Expiry is evaluated by SQLite's clock. A code is burned by any exchange attempt; replaying a used code revokes every token issued from it. Each refresh exchange issues a new pair, marks the old refresh token rotated and revokes the family's older access tokens; presenting a rotated refresh token revokes the whole family. Tokens are bound to the resource; `OAuthValidator` only accepts live, unrevoked access tokens whose resource equals `<public>/mcp`.
+
+Principal / consumer: the consent page's connection name (default `claude-ai` for Anthropic callbacks, else the sanitized client name or `client-<id>`; `[A-Za-z0-9._-]{1,48}`) is stored on the code and tokens; the principal is `oauth:<name>`, so it defaults the MCP `consumer`. Clients that share a name share a cursor.
+
+Wrong-passphrase limiter (in memory, per client IP): 3 free failures, then locks of 10 s, 20 s, 40 s ... capped at 15 min; 30 failures from anywhere in 15 minutes lock the page for everyone until the window drains. Refused attempts still return 429 for the correct passphrase. CSRF/validation failures do not count.
+
+Maintenance: the daily prune also deletes codes/tokens expired for over a day and stale clients (`oauth::cleanup`).
+
+Threat notes:
+- The passphrase page is the only human-facing attack surface; use a long passphrase and consider restricting `/authorize` at the proxy to your own IP/VPN. Do not restrict `/authorize` to Anthropic's egress ranges (160.79.104.0/21, 153.61.208.0/20): the owner's browser, not Anthropic, loads it. Those ranges may be required for `/mcp`, `/token`, `/register`, `/.well-known/*` as optional extra hardening.
+- Open registration lets anyone create client rows, but a client is useless without the passphrase at `/authorize`; the redirect allowlist stops an attacker-registered client from receiving codes elsewhere.
+- A trusted-proxy misconfiguration (proxy not listed) makes every client share the proxy address; listing a non-proxy lets that peer choose its identity.
+- Loopback redirects are inherently claimable by any local process; the consent page warns. Passphrase-guessing and token-guessing are bounded by the limiters and 256-bit tokens respectively.
+- No CORS headers (browser-based Inspector will not work against the OAuth endpoints), no scope enforcement (one scope, `warden`), no CIMD, no confidential clients.
 
 ## Schema
 
 - Migration 001: `tracked_products`, `cves` (per-source CVSS columns cna/adp/nvd + `cvss_all` JSON, SSVC, fixed versions, optional `raw`), `cve_affected` (raw + normalized vendor/product, squashed product, CPE vendor/product, versions JSON), `cve_product_matches`, `kev`, `epss`, `delivered`, `source_status`.
-- Migration 002: `oauth_clients`, `oauth_codes`, `oauth_tokens` (secrets stored hashed).
+- Migration 002/005: `oauth_clients`, `oauth_codes`, `oauth_tokens` (secrets stored hashed); 005 recreates them with resource, consumer label, token family, rotation and last-use columns.
 - Migration 003: per-source `fixed_cna`/`fixed_nvd`, `adp_kev_date`, `ssvc_timestamp`. Migration 004: `cve_affected.product_keys` (see Matching notes).
 - Indexes: `cves(last_modified)`, `cve_affected(vendor_norm, product_squash)`, `(product_squash)`, partial `(cpe_vendor, cpe_product)`, `delivered(cve_id)`, matches by product.
 - Tables are `STRICT`; timestamps are RFC 3339 UTC text.
@@ -91,5 +123,5 @@ Applied: cvelist/NVD/KEV/EPSS roles and per-source cursors; normalized record pr
 Deviations / notes:
 - `tracked_products.id` is a slug and `discovery_evidence` is not stored yet (add if discovery needs it).
 - `r2d2_sqlite` 0.34 / `rusqlite` 0.39 / `rusqlite_migration` 2.5 chosen as the newest set that shares one `libsqlite3-sys` and builds on rustc 1.94 (newer releases need 1.95). `scheduled-thread-pool` is pinned to 0.2.7 in `Cargo.lock` for the same reason.
-- `#![allow(dead_code)]` stays at the crate root (some model/db helpers are test-only or wait for Phase 2b).
+- `#![allow(dead_code)]` stays at the crate root (some model/db helpers are test-only).
 - Discovery's CVE probe samples the newest CVEs for a CPE (count query, then a 120-day `pubStartDate` window, falling back to the last page `startIndex = total - 5`), newest first: the oldest records carry vendor `n/a` and teach no CNA names.

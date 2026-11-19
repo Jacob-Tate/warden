@@ -356,6 +356,7 @@ impl Syncer {
                     return Ok(None);
                 }
                 let n = prune(c, days)?;
+                crate::oauth::cleanup(c)?;
                 repo::mark_success(c, PRUNE_KEY, None, None)?;
                 Ok(Some(n))
             })

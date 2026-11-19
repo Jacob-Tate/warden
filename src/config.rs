@@ -2,7 +2,7 @@
 
 use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -14,12 +14,39 @@ pub struct Config {
     pub api_keys: Vec<String>,
     /// Hash of the owner passphrase for the OAuth consent page (Phase 2).
     pub owner_passphrase_hash: Option<String>,
+    /// Allowed OAuth redirect URIs: exact URLs, or `scheme://host:*` (any port and path).
+    pub oauth_redirect_allow: Vec<String>,
+    /// Refresh-token lifetime in days (sliding: renewed on every rotation).
+    pub oauth_refresh_days: i64,
+    /// Reverse proxies whose `X-Forwarded-For` / `Forwarded` / `X-Real-IP` are believed.
+    pub trusted_proxies: Vec<ipnet::IpNet>,
     pub nvd_api_key: Option<String>,
     pub sync_interval: Duration,
     /// Unmatched, undelivered CVEs older than this many days are pruned.
     pub retention_days: i64,
     /// Window (days) before a product's creation in which CVEs still count as news.
     pub backfill_days: i64,
+}
+
+/// Default OAuth redirect allowlist: Claude's hosted callbacks plus loopback (Claude Code, Inspector).
+pub const DEFAULT_REDIRECT_ALLOW: &[&str] = &[
+    "https://claude.ai/api/mcp/auth_callback",
+    "http://localhost:*",
+    "http://127.0.0.1:*",
+    "http://[::1]:*",
+];
+
+/// Parse a comma-separated list of IPs and CIDRs (a bare IP is a /32 or /128).
+pub fn parse_proxies(v: &str) -> Result<Vec<ipnet::IpNet>> {
+    v.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            s.parse::<ipnet::IpNet>()
+                .or_else(|_| s.parse::<std::net::IpAddr>().map(ipnet::IpNet::from))
+                .with_context(|| format!("WARDEN_TRUSTED_PROXIES: not an IP or CIDR: {s}"))
+        })
+        .collect()
 }
 
 /// Parse `3600`, `90s`, `30m`, `6h` or `1d`.
@@ -93,6 +120,25 @@ impl Config {
                 })
                 .unwrap_or_default(),
             owner_passphrase_hash: nonempty("WARDEN_OWNER_PASSPHRASE_HASH"),
+            oauth_redirect_allow: match nonempty("WARDEN_OAUTH_REDIRECT_ALLOW") {
+                Some(v) => v
+                    .split(',')
+                    .map(|s| s.trim().to_owned())
+                    .filter(|s| !s.is_empty())
+                    .collect(),
+                None => DEFAULT_REDIRECT_ALLOW
+                    .iter()
+                    .map(|s| (*s).to_owned())
+                    .collect(),
+            },
+            oauth_refresh_days: match days("WARDEN_OAUTH_REFRESH_DAYS", 30)? {
+                0 => bail!("WARDEN_OAUTH_REFRESH_DAYS must be at least 1"),
+                d => d.min(365),
+            },
+            trusted_proxies: nonempty("WARDEN_TRUSTED_PROXIES")
+                .map(|v| parse_proxies(&v))
+                .transpose()?
+                .unwrap_or_default(),
             nvd_api_key: nonempty("NVD_API_KEY"),
             sync_interval: Duration::from_secs(secs.max(60)),
             retention_days: days("WARDEN_RETENTION_DAYS", 180)?,
@@ -148,6 +194,26 @@ mod tests {
         assert_eq!(c.api_keys, ["a", "b", "c"]);
         assert_eq!(c.public_url, "https://x.example");
         assert_eq!(c.bind.port(), 9000);
+    }
+
+    #[test]
+    fn oauth_and_proxy_settings() {
+        let c = cfg(&[]).unwrap();
+        assert!(
+            c.oauth_redirect_allow
+                .iter()
+                .any(|r| r.contains("claude.ai"))
+        );
+        assert!(c.trusted_proxies.is_empty() && c.oauth_refresh_days == 30);
+        let c = cfg(&[
+            ("WARDEN_TRUSTED_PROXIES", "10.0.0.0/8, 192.168.1.5,::1"),
+            ("WARDEN_OAUTH_REDIRECT_ALLOW", "https://a.example/cb"),
+        ])
+        .unwrap();
+        assert_eq!(c.trusted_proxies.len(), 3);
+        assert_eq!(c.oauth_redirect_allow, ["https://a.example/cb"]);
+        assert!(cfg(&[("WARDEN_TRUSTED_PROXIES", "nope")]).is_err());
+        assert!(cfg(&[("WARDEN_OAUTH_REFRESH_DAYS", "0")]).is_err());
     }
 
     #[test]
