@@ -1,0 +1,21 @@
+/target/
+**/*.rs.bk
+
+# Local data and secrets
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+/data/
+.env
+.env.*
+!.env.example
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Claude Code local settings
+.claude/settings.local.json
