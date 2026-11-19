@@ -176,11 +176,16 @@ pub enum Change {
     New,
     KevAdded,
     CvssChanged,
+    /// Published before the product was tracked (inside the backfill window).
+    Backfill,
+    /// The CVE was rejected after it was delivered.
+    Rejected,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FeedItem {
     pub cve: String,
+    /// Tracked product display name.
     pub product: String,
     pub published: Option<String>,
     pub cvss: Option<f64>,
@@ -189,7 +194,7 @@ pub struct FeedItem {
     pub kev: bool,
     pub epss: Option<f64>,
     pub change: Change,
-    /// At most 200 chars.
+    /// At most 200 chars, cut at a word boundary (ends with an ellipsis if cut).
     pub summary: String,
     pub fixed_versions: Vec<String>,
     pub source_url: String,
@@ -198,6 +203,7 @@ pub struct FeedItem {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceHealth {
     pub last_success: Option<String>,
+    pub last_error: Option<String>,
     pub stale: bool,
 }
 
@@ -205,5 +211,9 @@ pub struct SourceHealth {
 pub struct FeedEnvelope {
     pub generated_at: String,
     pub items: Vec<FeedItem>,
+    /// Matching items that did not fit under `limit`.
+    pub more: usize,
+    /// True if a core source (cvelist, kev) is stale: the feed may be missing news.
+    pub stale: bool,
     pub health: BTreeMap<String, SourceHealth>,
 }

@@ -14,6 +14,7 @@ use serde::de::DeserializeOwned;
 
 use super::DbResult;
 use crate::model::{Affected, Cvss, CvssSource, KevEntry, now_rfc3339};
+use crate::monitors::cve::matcher::row_keys;
 use crate::monitors::cve::normalize::{
     is_unknown, normalize_product, normalize_vendor, parse_cpe, squash,
 };
@@ -164,10 +165,12 @@ fn insert_affected(conn: &Connection, cve_id: &str, a: &Affected) -> DbResult<()
     let product_ok = product_raw.as_deref().filter(|p| !is_unknown(p));
     let product_norm = product_ok.map(normalize_product);
     let product_squash = product_ok.map(squash);
+    let product_keys =
+        product_ok.map(|p| row_keys(vendor_raw.as_deref().filter(|v| !is_unknown(v)), p));
     let mut st = conn.prepare_cached(
         "INSERT INTO cve_affected (cve_id, source, vendor_raw, product_raw, vendor_norm, \
-             product_norm, product_squash, cpe, cpe_vendor, cpe_product, versions) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+             product_norm, product_squash, cpe, cpe_vendor, cpe_product, versions, product_keys) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
     )?;
     st.execute(params![
         cve_id,
@@ -181,8 +184,37 @@ fn insert_affected(conn: &Connection, cve_id: &str, a: &Affected) -> DbResult<()
         parsed.as_ref().map(|p| p.vendor.as_str()),
         parsed.as_ref().map(|p| p.product.as_str()),
         serde_json::to_string(&a.versions)?,
+        product_keys,
     ])?;
     Ok(())
+}
+
+/// Fill `product_keys` for rows written before migration 004. Returns rows updated.
+pub fn backfill_product_keys(conn: &mut Connection) -> DbResult<usize> {
+    let rows: Vec<(i64, Option<String>, String)> = {
+        let mut st = conn.prepare(
+            "SELECT id, vendor_raw, product_raw FROM cve_affected              WHERE product_keys IS NULL AND product_raw IS NOT NULL",
+        )?;
+        st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<Result<_, _>>()?
+    };
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let tx = conn.transaction()?;
+    for (id, v, p) in &rows {
+        let keys = if is_unknown(p) {
+            String::new()
+        } else {
+            row_keys(v.as_deref().filter(|v| !is_unknown(v)), p)
+        };
+        tx.execute(
+            "UPDATE cve_affected SET product_keys = ?2 WHERE id = ?1",
+            params![id, keys],
+        )?;
+    }
+    tx.commit()?;
+    Ok(rows.len())
 }
 
 fn replace_affected(
@@ -392,6 +424,16 @@ pub fn upsert_nvd(conn: &Connection, r: &NvdUpsert) -> DbResult<UpsertResult> {
     } else {
         UpsertResult::Updated
     })
+}
+
+/// Delete CVEs (and, by cascade, their affected rows) last modified before
+/// `cutoff` (normalized RFC 3339) that match no tracked product, were never
+/// delivered to any consumer and are not in KEV. Returns the number removed.
+pub fn prune_unmatched(conn: &Connection, cutoff: &str) -> DbResult<usize> {
+    Ok(conn.execute(
+        "DELETE FROM cves WHERE last_modified < ?1            AND NOT EXISTS (SELECT 1 FROM cve_product_matches m WHERE m.cve_id = cves.cve_id)            AND NOT EXISTS (SELECT 1 FROM delivered d WHERE d.cve_id = cves.cve_id)            AND NOT EXISTS (SELECT 1 FROM kev k WHERE k.cve_id = cves.cve_id)",
+        [cutoff],
+    )?)
 }
 
 // ---- KEV / EPSS --------------------------------------------------------------

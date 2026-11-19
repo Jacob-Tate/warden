@@ -332,6 +332,8 @@ pub struct CpeAgg {
     pub product: String,
     pub counts: CpeCounts,
     pub title: Option<String>,
+    /// Other CPE parts the same vendor:product also appears under (merged in).
+    pub other_parts: Vec<String>,
 }
 
 fn strip_version_from_title(t: &str) -> String {
@@ -381,6 +383,7 @@ pub fn aggregate_cpes(pages: &[Value]) -> Vec<CpeAgg> {
                 product: parsed.product.clone(),
                 counts: CpeCounts::default(),
                 title: None,
+                other_parts: vec![],
             });
             e.counts.total += 1;
             if deprecated {
@@ -394,7 +397,51 @@ pub fn aggregate_cpes(pages: &[Value]) -> Vec<CpeAgg> {
             }
         }
     }
-    map.into_values().collect()
+    merge_parts(map.into_values().collect())
+}
+
+/// Merge entries that share `vendor:product` but differ in CPE part (`a`/`o`/`h`):
+/// matching keys on vendor:product only, so one candidate is enough. The part
+/// with the most live rows (then `a` over `o` over `h`) is kept as `part`; the
+/// rest are listed in `other_parts` and counts are summed.
+fn merge_parts(aggs: Vec<CpeAgg>) -> Vec<CpeAgg> {
+    let mut groups: BTreeMap<(String, String), Vec<CpeAgg>> = BTreeMap::new();
+    for a in aggs {
+        groups
+            .entry((a.vendor.clone(), a.product.clone()))
+            .or_default()
+            .push(a);
+    }
+    groups
+        .into_values()
+        .map(|mut g| {
+            let rank = |p: &str| match p {
+                "a" => 0,
+                "o" => 1,
+                _ => 2,
+            };
+            g.sort_by(|x, y| {
+                y.counts
+                    .live
+                    .cmp(&x.counts.live)
+                    .then(rank(&x.part).cmp(&rank(&y.part)))
+            });
+            let mut it = g.into_iter();
+            let mut main = it.next().expect("non-empty group");
+            for o in it {
+                main.counts.total += o.counts.total;
+                main.counts.live += o.counts.live;
+                main.counts.deprecated += o.counts.deprecated;
+                if main.title.is_none() {
+                    main.title = o.title.clone();
+                }
+                if !main.other_parts.contains(&o.part) {
+                    main.other_parts.push(o.part);
+                }
+            }
+            main
+        })
+        .collect()
 }
 
 fn first_title(cpe: &Value) -> Option<String> {
@@ -786,6 +833,12 @@ pub async fn discover_with<N: Net>(
         if let Some(t) = &agg.title {
             ev.notes.push(format!("CPE title: {t}"));
         }
+        if !agg.other_parts.is_empty() {
+            ev.notes.push(format!(
+                "also listed under CPE part(s): {} (merged)",
+                agg.other_parts.join(", ")
+            ));
+        }
         let mut score = score;
         let mut cna: Vec<CnaName> = Vec::new();
         if i < opts.probe_top {
@@ -1068,6 +1121,7 @@ mod tests {
                 deprecated: 0,
             },
             title: Some(title.into()),
+            other_parts: vec![],
         };
         let real = score_cpe(&mk("docker", "docker", "Docker"), &q).0;
         let plugin = score_cpe(&mk("amirraminfar", "dozzle", "Dozzle for Docker"), &q);
@@ -1098,6 +1152,7 @@ mod tests {
             product: "ios_xe".into(),
             counts: CpeCounts::default(),
             title: None,
+            other_parts: vec![],
         };
         let names = learn_cna_names(&rec, &ios);
         assert_eq!(names.len(), 1);
@@ -1130,6 +1185,7 @@ mod tests {
             product: p.into(),
             counts: CpeCounts::default(),
             title: None,
+            other_parts: vec![],
         };
         let ems = kev_hits_for_cpe(&kev_rows(), &mk("a", "fortinet", "forticlientems"), &[]);
         assert_eq!(ems.len(), 1);
@@ -1252,6 +1308,22 @@ mod tests {
         assert!(c.product.exclude_keywords.contains(&"fujitsu".to_owned()));
         assert!(c.product.exclude_keywords.contains(&"emc".to_owned()));
         assert!(r.warnings.iter().any(|w| w.contains("keyword-only")));
+    }
+
+    #[test]
+    fn merges_same_vendor_product_across_parts() {
+        let page = serde_json::json!({"products": [
+            {"cpe": {"cpeName": "cpe:2.3:a:grafana:grafana:9.0.0:*:*:*:*:*:*:*", "deprecated": false,
+                     "titles": [{"lang": "en", "title": "Grafana 9.0.0"}]}},
+            {"cpe": {"cpeName": "cpe:2.3:a:grafana:grafana:9.1.0:*:*:*:*:*:*:*", "deprecated": false}},
+            {"cpe": {"cpeName": "cpe:2.3:o:grafana:grafana:1.0:*:*:*:*:*:*:*", "deprecated": false}},
+        ]});
+        let aggs = aggregate_cpes(&[page]);
+        assert_eq!(aggs.len(), 1, "{aggs:?}");
+        assert_eq!(aggs[0].part, "a");
+        assert_eq!(aggs[0].other_parts, ["o"]);
+        assert_eq!(aggs[0].counts.total, 3);
+        assert_eq!(aggs[0].counts.live, 3);
     }
 
     #[test]

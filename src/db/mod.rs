@@ -41,6 +41,7 @@ static MIGRATIONS: LazyLock<Migrations<'static>> = LazyLock::new(|| {
         M::up(include_str!("migrations/001_core.sql")),
         M::up(include_str!("migrations/002_oauth.sql")),
         M::up(include_str!("migrations/003_sources_split.sql")),
+        M::up(include_str!("migrations/004_product_keys.sql")),
     ])
 });
 
@@ -63,6 +64,9 @@ impl Db {
         if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
             std::fs::create_dir_all(dir)?;
         }
+        // Switch a fresh file to WAL on one connection first: the pool opens its
+        // connections concurrently and they would race on the journal-mode change.
+        init_conn(&mut Connection::open(path)?)?;
         let manager = SqliteConnectionManager::file(path).with_init(init_conn);
         Self::from_manager(manager, 8)
     }
@@ -77,7 +81,11 @@ impl Db {
     fn from_manager(manager: SqliteConnectionManager, size: u32) -> DbResult<Self> {
         let pool = Pool::builder().max_size(size).build(manager)?;
         let db = Self { pool };
-        db.with_conn(|c| MIGRATIONS.to_latest(c).map_err(DbError::from))?;
+        db.with_conn(|c| {
+            MIGRATIONS.to_latest(c).map_err(DbError::from)?;
+            cve_repo::backfill_product_keys(c)?;
+            Ok(())
+        })?;
         Ok(db)
     }
 

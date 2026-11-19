@@ -233,6 +233,20 @@ fn candidate_ids(
                 &mut ids,
             )?;
         }
+        // Matcher-form keys stored per row (`product_keys`, migration 004): covers
+        // short forms, list segments, vendor-stripped names and initialisms that
+        // `product_squash` (= squash(product_raw)) cannot express.
+        let all_forms: Vec<String> = forms.iter().cloned().collect();
+        for chunk in all_forms.chunks(50) {
+            let cond = vec!["product_keys LIKE ?"; chunk.len()].join(" OR ");
+            let pats: Vec<String> = chunk.iter().map(|f| format!("% {f} %")).collect();
+            collect(
+                conn,
+                &format!("SELECT DISTINCT cve_id FROM cve_affected WHERE {cond}"),
+                &pats,
+                &mut ids,
+            )?;
+        }
         // Forms inside list-like / vendor-prefixed products ("ciscoiosandiosxe").
         let likes: Vec<String> = forms
             .iter()
@@ -371,8 +385,8 @@ mod tests {
     ) {
         conn.execute(
             "INSERT INTO cve_affected (cve_id, source, vendor_raw, product_raw, vendor_norm, \
-                 product_norm, product_squash, cpe_vendor, cpe_product) \
-             VALUES (?1, 'cna', ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                 product_norm, product_squash, cpe_vendor, cpe_product, product_keys) \
+             VALUES (?1, 'cna', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 id,
                 v,
@@ -381,7 +395,8 @@ mod tests {
                 p.map(normalize_product),
                 p.map(squash),
                 cpe.map(|c| c.0),
-                cpe.map(|c| c.1)
+                cpe.map(|c| c.1),
+                p.map(|p| crate::monitors::cve::matcher::row_keys(v, p))
             ],
         )
         .unwrap();
@@ -561,6 +576,72 @@ mod tests {
                 "CVE-3 still matches via cna-name keys on KEV"
             );
             assert!(rematch_product(c, "nope")?.is_none());
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn rematch_prefilter_finds_vendor_and_edition_variants() {
+        let db = Db::open_in_memory().unwrap();
+        db.with_conn(|c| {
+            // (id, vendor_raw, product_raw)
+            let rows = [
+                ("CVE-A", "Apache Software Foundation", "Apache HTTP Server"),
+                ("CVE-B", "Fortinet, Inc.", "Fortinet FortiOS"),
+                ("CVE-C", "Fortinet", "FortiOS"),
+                ("CVE-D", "Cisco", "Cisco IOS and IOS XE"),
+                (
+                    "CVE-E",
+                    "Arista Networks, Inc.",
+                    "Extensible Operating System",
+                ),
+                ("CVE-F", "n/a", "Apache HTTP Server"),
+            ];
+            for (id, v, p) in rows {
+                add_cve(c, id, "x", "PUBLISHED");
+                add_aff(c, id, Some(v), Some(p), None);
+            }
+            let mut http = product("apache-http", "HTTP Server");
+            http.cna_names = vec![CnaName {
+                vendor: "Apache".into(),
+                product: "HTTP Server".into(),
+                source_cna: None,
+            }];
+            let mut fos = product("fortios", "FortiOS");
+            fos.cna_names = vec![CnaName {
+                vendor: "Fortinet".into(),
+                product: "FortiOS".into(),
+                source_cna: None,
+            }];
+            let mut ios = product("ios", "IOS");
+            ios.cna_names = vec![CnaName {
+                vendor: "Cisco".into(),
+                product: "IOS".into(),
+                source_cna: None,
+            }];
+            let mut eos = product("eos", "EOS");
+            eos.cna_names = vec![CnaName {
+                vendor: "Arista".into(),
+                product: "EOS".into(),
+                source_cna: None,
+            }];
+            let expect = [
+                (&http, vec!["CVE-A", "CVE-F"]),
+                (&fos, vec!["CVE-B", "CVE-C"]),
+                (&ios, vec!["CVE-D"]),
+                (&eos, vec!["CVE-E"]),
+            ];
+            for (p, want) in expect {
+                repo::upsert_product(c, p)?;
+                rematch_product(c, &p.id)?;
+                let got: Vec<String> = matches(c)
+                    .into_iter()
+                    .filter(|m| m.1 == p.id)
+                    .map(|m| m.0)
+                    .collect();
+                assert_eq!(got, want, "product {}", p.id);
+            }
             Ok(())
         })
         .unwrap();

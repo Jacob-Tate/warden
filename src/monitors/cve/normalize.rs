@@ -65,6 +65,21 @@ const VENDOR_SUFFIXES: &[&str] = &[
     "technologies",
     "foundation",
     "project",
+    "pty",
+    "pte",
+    "bv",
+    "nv",
+    "ab",
+    "sas",
+    "srl",
+    "spa",
+    "oy",
+    "kk",
+    "systems",
+    "software",
+    "group",
+    "holdings",
+    "international",
 ];
 
 /// Vendor placeholders used by CNAs when the vendor is unknown.

@@ -285,6 +285,21 @@ fn forms(segs: &[String], vendors: &[&str], with_initialism: bool) -> HashSet<St
     out
 }
 
+/// Space-delimited comparable forms of one affected row (` form1 form2 `, empty if
+/// the product is unknown), stored in `cve_affected.product_keys` so the DB
+/// prefilter can find rows whose matcher forms differ from `squash(product_raw)`
+/// (list-like products, vendor prefixes, edition words, initialisms).
+pub fn row_keys(vendor: Option<&str>, product: &str) -> String {
+    let row = NameRow::new(vendor, Some(product));
+    if row.segs.is_empty() {
+        return String::new();
+    }
+    let vs: Vec<&str> = row.vendor.iter().map(String::as_str).collect();
+    let mut f: Vec<String> = forms(&row.segs, &vs, true).into_iter().collect();
+    f.sort();
+    format!(" {} ", f.join(" "))
+}
+
 /// Boundary-delimited alternation of phrases; `None` if no usable phrase.
 fn phrase_regex(phrases: &[String]) -> Option<(Regex, Vec<String>)> {
     let mut parts = Vec::new();
@@ -417,12 +432,18 @@ impl CompiledProduct {
         }
         let row_forms = forms(&row.segs, &vrefs, true);
         let row_vendor = row.vendor.as_deref().map(squash_n);
+        let vendor_known = row.vendor.as_deref().is_some_and(|rv| {
+            // "Moodle Pty" still starts with the known vendor "moodle".
+            self.vendors
+                .iter()
+                .any(|v| rv == v || rv.starts_with(&format!("{v} ")))
+        });
         for key in keys {
             for f in key.forms.iter().filter(|f| row_forms.contains(*f)) {
                 let ok = match &row_vendor {
-                    Some(rv) if self.vendor_squash.contains(rv) => true,
+                    Some(rv) if self.vendor_squash.contains(rv) || vendor_known => true,
                     Some(rv) if key.vendor.as_ref() == Some(rv) => true,
-                    Some(_) if key.vendor.is_some() => false,
+                    Some(_) if key.vendor.is_some() || !self.vendors.is_empty() => false,
                     _ => is_distinctive(f),
                 };
                 if ok {
@@ -846,5 +867,64 @@ mod tests {
             match_cve(&ps, &c),
             vec![("moodle".to_string(), MatchedBy::Cpe)]
         );
+    }
+
+    #[test]
+    fn vendor_name_variants_are_not_rejected() {
+        // Product knows only its CPE vendor ("grafana"); CNAs write corporate names.
+        let mut g = product("grafana", "Grafana");
+        g.cpes = vec![cpe("grafana", "grafana")];
+        g.cna_names = vec![cna("Grafana", "Grafana")];
+        for v in ["Grafana Labs", "Grafana", "GRAFANA LABS, INC.", "grafana"] {
+            let c = cve("x", vec![row(Some(v), Some("Grafana"))], None);
+            assert_eq!(m(&g, &c), Some(MatchedBy::CnaName), "vendor {v}");
+        }
+
+        let mut a = product("apache-http-server", "Apache HTTP Server");
+        a.cpes = vec![cpe("apache", "http_server")];
+        a.cna_names = vec![cna("Apache", "HTTP Server")];
+        for v in [
+            "Apache Software Foundation",
+            "The Apache Software Foundation",
+            "apache",
+            "Apache",
+        ] {
+            for p in ["Apache HTTP Server", "HTTP Server"] {
+                let c = cve("x", vec![row(Some(v), Some(p))], None);
+                assert_eq!(m(&a, &c), Some(MatchedBy::CnaName), "{v} / {p}");
+            }
+        }
+        // Different vendor with the same product name is still rejected.
+        let other = cve("x", vec![row(Some("Acme Corp"), Some("HTTP Server"))], None);
+        assert_eq!(m(&a, &other), None);
+
+        let mut f = product("fortios", "FortiOS");
+        f.cpes = vec![cpe("fortinet", "fortios")];
+        f.cna_names = vec![cna("Fortinet", "FortiOS")];
+        for v in ["Fortinet, Inc.", "Fortinet Inc", "fortinet", "Fortinet"] {
+            for p in ["FortiOS", "Fortinet FortiOS"] {
+                let c = cve("x", vec![row(Some(v), Some(p))], None);
+                assert_eq!(m(&f, &c), Some(MatchedBy::CnaName), "{v} / {p}");
+            }
+        }
+        let mut mo = product("moodle", "Moodle");
+        mo.cpes = vec![cpe("moodle", "moodle")];
+        mo.cna_names = vec![cna("Moodle", "Moodle")];
+        let c = cve("x", vec![row(Some("Moodle Pty Ltd"), Some("Moodle"))], None);
+        assert_eq!(m(&mo, &c), Some(MatchedBy::CnaName));
+    }
+
+    #[test]
+    fn row_keys_cover_stripped_and_listed_forms() {
+        let k = row_keys(Some("Apache Software Foundation"), "Apache HTTP Server");
+        assert!(
+            k.contains(" httpserver ") && k.contains(" apachehttpserver "),
+            "{k}"
+        );
+        let k = row_keys(Some("Cisco"), "Cisco IOS and IOS XE");
+        assert!(k.contains(" ios ") && k.contains(" iosxe "), "{k}");
+        let k = row_keys(Some("Arista"), "Extensible Operating System");
+        assert!(k.contains(" eos "), "{k}");
+        assert_eq!(row_keys(None, "n/a"), "");
     }
 }
