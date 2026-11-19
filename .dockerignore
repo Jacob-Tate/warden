@@ -1,0 +1,15 @@
+target/
+.git/
+.github/
+data/
+*.db
+*.db-*
+.env
+.env.*
+!.env.example
+scratch/
+.vscode/
+.idea/
+.claude/
+docs/
+*.md

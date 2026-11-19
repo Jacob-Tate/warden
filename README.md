@@ -51,6 +51,8 @@ Optional hardening: Anthropic's outbound ranges are `160.79.104.0/21` and `153.6
 
 Behind a reverse proxy, set `WARDEN_TRUSTED_PROXIES` (comma-separated IPs/CIDRs of the proxy as warden sees it). Without it all clients look like the proxy to the failed-login limiters.
 
+Docker image, compose file and reverse proxy setup: see [docs/deploy.md](docs/deploy.md).
+
 ## Planned design
 
 - **Language:** Rust (axum, [rmcp](https://github.com/modelcontextprotocol/rust-sdk)), SQLite, one Docker container.

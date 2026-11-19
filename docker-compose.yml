@@ -1,0 +1,41 @@
+# Example homelab deployment. See docs/deploy.md.
+services:
+  warden:
+    image: ghcr.io/jacob-tate/warden:latest
+    # build: .                      # build locally instead of pulling
+    container_name: warden
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # Fixed for the container layout; these override any value in .env
+      WARDEN_DB_PATH: /data/warden.db
+      WARDEN_BIND: 0.0.0.0:8080
+      TMPDIR: /tmp                  # NVD/CVE feed downloads are spooled here (tmpfs below)
+    volumes:
+      - warden-data:/data
+    ports:
+      # Reverse proxy on the same host. Use "8080:8080" only if the proxy is on another machine.
+      - "127.0.0.1:8080:8080"
+    # Alternative: share a Docker network with the proxy container and drop `ports:`
+    # (proxy then reaches http://warden:8080; set WARDEN_TRUSTED_PROXIES to that network's subnet):
+    # networks: [proxy]
+    read_only: true
+    tmpfs:
+      - /tmp:size=512m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080 && printf 'GET /healthz HTTP/1.0\r\nHost: localhost\r\n\r\n' >&3 && head -n1 <&3 | grep -q ' 200 '"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+
+volumes:
+  warden-data:
+
+# networks:
+#   proxy:
+#     external: true
