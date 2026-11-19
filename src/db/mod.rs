@@ -7,6 +7,8 @@
 //! lock and a panic poisons everything. `busy_timeout` makes concurrent
 //! writers queue instead of failing.
 
+pub mod cve_repo;
+pub mod match_repo;
 pub mod repo;
 
 use std::{path::Path, sync::LazyLock, time::Duration};
@@ -38,6 +40,7 @@ static MIGRATIONS: LazyLock<Migrations<'static>> = LazyLock::new(|| {
     Migrations::new(vec![
         M::up(include_str!("migrations/001_core.sql")),
         M::up(include_str!("migrations/002_oauth.sql")),
+        M::up(include_str!("migrations/003_sources_split.sql")),
     ])
 });
 

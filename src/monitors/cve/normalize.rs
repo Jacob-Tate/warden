@@ -111,6 +111,39 @@ pub fn strip_vendor_prefix(vendor_norm: &str, product_norm: &str) -> String {
     }
 }
 
+/// Split a list-like product string into its parts: KEV and CNAs write
+/// `"FortiOS and FortiProxy"`, `"IOS, IOS XR, and IOS XE"`, `"A / B"`.
+/// The whole (unsplit) string is NOT included; callers add it themselves.
+pub fn split_product_list(s: &str) -> Vec<String> {
+    let lower = s.to_lowercase();
+    let mut buf = String::with_capacity(lower.len());
+    for part in lower.split(" and ") {
+        if !buf.is_empty() {
+            buf.push('|');
+        }
+        buf.push_str(part);
+    }
+    buf.split([',', '/', '&', ';', '|', '+'])
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Product placeholders that carry no identity (superset of [`is_unknown`]).
+pub fn is_unknown_product(s: &str) -> bool {
+    is_unknown(s)
+        || matches!(
+            norm(s).as_str(),
+            "multiple products" | "multiple" | "various" | "all products" | "multiple versions"
+        )
+}
+
+/// Lowercase ASCII slug (`"FortiClient EMS"` -> `"forticlient-ems"`).
+pub fn slugify(s: &str) -> String {
+    norm(s).replace(' ', "-")
+}
+
 /// A parsed CPE 2.3 formatted string.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedCpe {
@@ -254,5 +287,20 @@ mod tests {
         assert!(parse_cpe("cpe:2.3:x:v:p").is_none());
         assert!(parse_cpe("cpe:2.3:a:v").is_none());
         assert!(parse_cpe("cpe:2.3:a::p").is_none());
+    }
+
+    #[test]
+    fn splits_product_lists() {
+        assert_eq!(
+            split_product_list("FortiOS and FortiProxy"),
+            ["fortios", "fortiproxy"]
+        );
+        assert_eq!(
+            split_product_list("IOS, IOS XR, and IOS XE"),
+            ["ios", "ios xr", "ios xe"]
+        );
+        assert_eq!(split_product_list("EOS"), ["eos"]);
+        assert!(is_unknown_product("Multiple Products"));
+        assert_eq!(slugify("FortiClient EMS"), "forticlient-ems");
     }
 }

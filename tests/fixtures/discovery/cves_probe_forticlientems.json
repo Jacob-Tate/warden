@@ -1,0 +1,1 @@
+{"resultsPerPage":5,"startIndex":0,"totalResults":9,"format":"NVD_CVE","version":"2.0","vulnerabilities":[{"cve":{"id":"CVE-2026-21643","sourceIdentifier":"psirt@fortinet.com"}},{"cve":{"id":"CVE-2025-22222"}},{"cve":{"id":"CVE-2024-11111"}}]}
