@@ -15,6 +15,7 @@ mod mcp;
 mod model;
 mod monitors;
 mod oauth;
+mod ratelimit;
 
 use std::sync::Arc;
 
@@ -276,6 +277,10 @@ async fn serve(config: Arc<config::Config>, db: db::Db, syncer: Arc<Syncer>) -> 
         tracing::info!(
             count = config.trusted_proxies.len(),
             "trusting forwarded client IPs from proxies"
+        );
+    } else if oauth.is_some() {
+        tracing::warn!(
+            "OAuth is enabled but WARDEN_TRUSTED_PROXIES is empty: behind a reverse proxy (or the Docker              bridge) every client appears as the proxy, so the per-address rate limits are shared by              everyone. Set it to the proxy as warden sees it (e.g. 172.16.0.0/12 for the Docker bridge range,              or the proxy container's network). See docs/deploy.md."
         );
     }
     let shutdown = tokio_util::sync::CancellationToken::new();

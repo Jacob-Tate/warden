@@ -300,8 +300,9 @@ pub fn row_keys(vendor: Option<&str>, product: &str) -> String {
     format!(" {} ", f.join(" "))
 }
 
-/// Boundary-delimited alternation of phrases; `None` if no usable phrase.
-fn phrase_regex(phrases: &[String]) -> Option<(Regex, Vec<String>)> {
+/// Boundary-delimited alternation of phrases; `Ok(None)` if no usable phrase, `Err` if the
+/// resulting pattern does not compile (e.g. exceeds the regex size limit).
+fn phrase_regex_checked(phrases: &[String]) -> Result<Option<(Regex, Vec<String>)>, regex::Error> {
     let mut parts = Vec::new();
     let mut norms = Vec::new();
     for p in phrases {
@@ -317,13 +318,39 @@ fn phrase_regex(phrases: &[String]) -> Option<(Regex, Vec<String>)> {
         parts.push(toks.join(r"[\s_\-]+"));
     }
     if parts.is_empty() {
-        return None;
+        return Ok(None);
     }
     let pat = format!(
         r"(?i)(?:^|[^\p{{L}}\p{{N}}])({})(?:[^\p{{L}}\p{{N}}]|$)",
         parts.join("|")
     );
-    Regex::new(&pat).ok().map(|re| (re, norms))
+    Regex::new(&pat).map(|re| Some((re, norms)))
+}
+
+/// Like [`phrase_regex_checked`], but a failure is logged (matching by that list is then
+/// disabled) instead of silently ignored. Products are validated when saved
+/// ([`check_patterns`]), so this only fires for rows that predate the check.
+fn phrase_regex(phrases: &[String]) -> Option<(Regex, Vec<String>)> {
+    match phrase_regex_checked(phrases) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, "keyword pattern does not compile; matching by it is disabled");
+            None
+        }
+    }
+}
+
+/// Verify that a product's keyword lists compile; the message names the offending list.
+pub fn check_patterns(p: &TrackedProduct) -> Result<(), String> {
+    for (label, list) in [
+        ("keywords", &p.keywords),
+        ("exclude_keywords", &p.exclude_keywords),
+    ] {
+        phrase_regex_checked(list).map_err(|e| {
+            format!("{label} cannot be compiled into a matcher ({e}); use fewer or shorter phrases")
+        })?;
+    }
+    Ok(())
 }
 
 impl CompiledProduct {

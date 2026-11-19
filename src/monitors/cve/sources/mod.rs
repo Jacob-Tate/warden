@@ -91,13 +91,88 @@ where
     }
 }
 
-/// Download a response body to a temp file in chunks (no full in-memory copy).
+/// Download caps (bytes of the body as delivered to us, i.e. after any transport gzip).
+pub(crate) const MAX_ZIP_BYTES: u64 = 200 * 1024 * 1024;
+pub(crate) const MAX_KEV_BYTES: u64 = 20 * 1024 * 1024;
+pub(crate) const MAX_EPSS_GZ_BYTES: u64 = 50 * 1024 * 1024;
+pub(crate) const MAX_NVD_GZ_BYTES: u64 = 200 * 1024 * 1024;
+/// Largest decompressed stream (gzip) accepted.
+pub(crate) const MAX_DECOMPRESSED_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// A reader that fails (rather than silently truncating) once `limit` bytes have been read.
+pub(crate) struct CapReader<R> {
+    inner: R,
+    left: u64,
+}
+
+impl<R> CapReader<R> {
+    pub(crate) fn new(inner: R, limit: u64) -> Self {
+        Self { inner, left: limit }
+    }
+}
+
+impl<R: std::io::Read> std::io::Read for CapReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if n as u64 > self.left {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "decompressed data exceeds the size limit",
+            ));
+        }
+        self.left -= n as u64;
+        Ok(n)
+    }
+}
+
+/// Stream a response body into `sink`, failing once more than `max` bytes arrive.
+async fn stream_capped(
+    mut resp: reqwest::Response,
+    url: &str,
+    max: u64,
+    mut sink: impl FnMut(&[u8]) -> Result<()>,
+) -> Result<()> {
+    if resp.content_length().is_some_and(|l| l > max) {
+        anyhow::bail!("GET {url}: response is larger than the {max}-byte limit");
+    }
+    let mut seen = 0u64;
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .with_context(|| format!("reading {url}"))?
+    {
+        seen += chunk.len() as u64;
+        if seen > max {
+            anyhow::bail!("GET {url}: response exceeded the {max}-byte limit");
+        }
+        sink(&chunk)?;
+    }
+    Ok(())
+}
+
+/// Read a response body into memory, capped at `max` bytes.
+pub(crate) async fn read_body_capped(
+    resp: reqwest::Response,
+    url: &str,
+    max: u64,
+) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    stream_capped(resp, url, max, |c| {
+        out.extend_from_slice(c);
+        Ok(())
+    })
+    .await?;
+    Ok(out)
+}
+
+/// Download a response body to a temp file in chunks (no full in-memory copy), capped at `max`.
 pub(crate) async fn download_to_temp(
     client: &reqwest::Client,
     url: &str,
+    max: u64,
 ) -> Result<tempfile::NamedTempFile> {
     use std::io::Write;
-    let mut resp = client
+    let resp = client
         .get(url)
         .send()
         .await
@@ -105,13 +180,7 @@ pub(crate) async fn download_to_temp(
         .error_for_status()
         .with_context(|| format!("GET {url}"))?;
     let mut file = tempfile::NamedTempFile::new().context("creating temp file")?;
-    while let Some(chunk) = resp
-        .chunk()
-        .await
-        .with_context(|| format!("reading {url}"))?
-    {
-        file.write_all(&chunk)?;
-    }
+    stream_capped(resp, url, max, |c| Ok(file.write_all(c)?)).await?;
     file.flush()?;
     Ok(file)
 }
@@ -265,5 +334,49 @@ pub(crate) mod testutil {
             db: crate::db::Db::open_in_memory().unwrap(),
             http: super::build_client().unwrap(),
         }
+    }
+}
+
+#[cfg(test)]
+mod cap_tests {
+    use super::testutil::{Canned, serve};
+    use super::*;
+    use std::io::Read;
+
+    #[test]
+    fn cap_reader_errors_instead_of_truncating() {
+        let mut out = Vec::new();
+        let r = CapReader::new(&b"0123456789"[..], 10).read_to_end(&mut out);
+        assert!(r.is_ok() && out.len() == 10);
+        let mut out = Vec::new();
+        let e = CapReader::new(&b"0123456789x"[..], 10)
+            .read_to_end(&mut out)
+            .unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn downloads_are_capped() {
+        let server = serve(|req, _| {
+            let n: usize = req.path_and_query.trim_start_matches('/').parse().unwrap();
+            Canned::ok(vec![b'x'; n])
+        })
+        .await;
+        let client = build_client().unwrap();
+        let get = |n: usize| {
+            let (c, u) = (client.clone(), format!("{}/{n}", server.base));
+            async move { c.get(&u).send().await.unwrap() }
+        };
+        let ok = read_body_capped(get(100).await, "u", 100).await.unwrap();
+        assert_eq!(ok.len(), 100);
+        let err = read_body_capped(get(101).await, "u", 100)
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("limit"), "{err:#}");
+        // temp-file variant
+        let url = format!("{}/50", server.base);
+        assert!(download_to_temp(&client, &url, 50).await.is_ok());
+        let url = format!("{}/51", server.base);
+        assert!(download_to_temp(&client, &url, 50).await.is_err());
     }
 }

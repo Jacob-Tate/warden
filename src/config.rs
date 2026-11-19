@@ -16,6 +16,8 @@ pub struct Config {
     pub owner_passphrase_hash: Option<String>,
     /// Allowed OAuth redirect URIs: exact URLs, or `scheme://host:*` (any port and path).
     pub oauth_redirect_allow: Vec<String>,
+    /// `WARDEN_OAUTH_REGISTRATION=open|closed`: closed disables dynamic client registration.
+    pub oauth_registration_open: bool,
     /// Refresh-token lifetime in days (sliding: renewed on every rotation).
     pub oauth_refresh_days: i64,
     /// Reverse proxies whose `X-Forwarded-For` / `Forwarded` / `X-Real-IP` are believed.
@@ -130,6 +132,14 @@ impl Config {
                     .iter()
                     .map(|s| (*s).to_owned())
                     .collect(),
+            },
+            oauth_registration_open: match nonempty("WARDEN_OAUTH_REGISTRATION")
+                .map(|v| v.to_ascii_lowercase())
+                .as_deref()
+            {
+                None | Some("open") => true,
+                Some("closed") => false,
+                Some(o) => bail!("WARDEN_OAUTH_REGISTRATION must be `open` or `closed`, got `{o}`"),
             },
             oauth_refresh_days: match days("WARDEN_OAUTH_REFRESH_DAYS", 30)? {
                 0 => bail!("WARDEN_OAUTH_REFRESH_DAYS must be at least 1"),

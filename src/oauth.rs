@@ -20,14 +20,13 @@
 //!   registered value at `/authorize`; failures there never redirect.
 
 use std::{
-    collections::HashMap,
     net::IpAddr,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
 use anyhow::{Result, bail};
-use argon2::{Argon2, PasswordHasher, PasswordVerifier};
+use argon2::{Algorithm, Argon2, Params, PasswordHasher, PasswordVerifier, Version};
 use axum::{
     Extension, Form, Json, Router,
     extract::{Query, State},
@@ -44,8 +43,12 @@ use subtle::ConstantTimeEq;
 use url::Url;
 
 use crate::{
-    auth::{ClientIp, Principal, TokenValidator, ValidateFuture, generate_key, hash_key},
+    auth::{
+        ClientIp, FailureLimiter, MAX_TRACKED, Principal, TokenValidator, ValidateFuture,
+        generate_key, hash_key, token_shaped,
+    },
     db::{Db, DbResult},
+    ratelimit::{Counter, Expiry, Table},
 };
 
 /// Authorization-code lifetime.
@@ -54,6 +57,8 @@ const CODE_TTL_SECS: i64 = 60;
 pub const ACCESS_TTL_SECS: i64 = 3600;
 /// Registered clients kept at most (see [`register_client`] for the eviction policy).
 const MAX_CLIENTS: i64 = 50;
+/// A client younger than this is never evicted to make room.
+const CLIENT_MIN_AGE_SECS: i64 = 3600;
 /// Clients that never got a token, or are unused for this long, are pruned.
 const CLIENT_STALE_DAYS: i64 = 30;
 const NOW: &str = "strftime('%Y-%m-%dT%H:%M:%SZ','now')";
@@ -69,6 +74,8 @@ pub struct OAuthConfig {
     pub redirect_allow: Vec<String>,
     pub refresh_ttl_secs: i64,
     pub secure_cookie: bool,
+    /// `WARDEN_OAUTH_REGISTRATION`: false closes `/register` (and hides it from metadata).
+    pub registration_open: bool,
 }
 
 #[derive(Clone)]
@@ -77,6 +84,12 @@ pub struct OAuthState {
     pub cfg: Arc<OAuthConfig>,
     passphrases: Arc<PassphraseLimiter>,
     registrations: Arc<RegistrationLimiter>,
+    /// Failed `/token` and `/revoke` attempts per address.
+    token_failures: Arc<FailureLimiter>,
+    /// Bounds concurrent argon2 evaluations (memory/CPU DoS guard).
+    argon: Arc<tokio::sync::Semaphore>,
+    /// Random per process; keys the CSRF tokens (a restart invalidates open consent pages).
+    csrf_secret: Arc<[u8; 32]>,
 }
 
 impl OAuthState {
@@ -86,6 +99,16 @@ impl OAuthState {
             cfg: Arc::new(cfg),
             passphrases: Arc::default(),
             registrations: Arc::default(),
+            token_failures: Arc::new(FailureLimiter::new(
+                TOKEN_MAX_FAILURES,
+                Duration::from_secs(300),
+            )),
+            argon: Arc::new(tokio::sync::Semaphore::new(ARGON_PERMITS)),
+            csrf_secret: Arc::new({
+                let mut b = [0u8; 32];
+                getrandom::fill(&mut b).expect("random number generator");
+                b
+            }),
         }
     }
 
@@ -105,6 +128,13 @@ pub fn check_hash(hash: &str) -> Result<()> {
         Err(argon2::password_hash::Error::PasswordInvalid) => Ok(()),
         Err(e) => bail!("WARDEN_OWNER_PASSPHRASE_HASH is not a valid argon2 hash: {e}"),
     }
+}
+
+/// Parameters for *new* hashes (`hash-passphrase`): argon2id, 64 MiB, 3 passes, 1 lane.
+/// Existing hashes keep verifying with whatever parameters their PHC string carries.
+fn hasher() -> Argon2<'static> {
+    let params = Params::new(64 * 1024, 3, 1, None).expect("static argon2 parameters");
+    Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
 }
 
 fn verify_passphrase(hash: &str, pw: &str) -> bool {
@@ -133,7 +163,7 @@ pub fn hash_passphrase_command() -> Result<String> {
     if pw.chars().count() < 12 {
         bail!("use a passphrase of at least 12 characters (a few random words is fine)");
     }
-    let hash = Argon2::default()
+    let hash = hasher()
         .hash_password(pw.as_bytes())
         .map_err(|e| anyhow::anyhow!("hashing failed: {e}"))?
         .to_string();
@@ -148,26 +178,40 @@ pub fn hash_passphrase_command() -> Result<String> {
 const PW_WINDOW: Duration = Duration::from_secs(900);
 /// Failures per address before backoff starts.
 const PW_FREE: u32 = 3;
-/// Failures from all addresses within the window that lock the consent page entirely.
-const PW_GLOBAL_MAX: usize = 30;
+/// Failures from all addresses (within one window) tolerated before responses get slower.
+const PW_GLOBAL_FREE: u32 = 10;
+/// Added delay per global failure beyond [`PW_GLOBAL_FREE`], and its cap.
+const PW_DELAY_STEP_MS: u64 = 250;
+const PW_DELAY_CAP_MS: u64 = 30_000;
+/// Concurrent argon2 evaluations; the rest wait briefly, then get 429.
+const ARGON_PERMITS: usize = 2;
+const ARGON_WAIT: Duration = Duration::from_secs(2);
 
-struct IpFails {
-    count: u32,
-    last: Instant,
-}
-
-#[derive(Default)]
 struct PwState {
-    per_ip: HashMap<IpAddr, IpFails>,
-    global: Vec<Instant>,
+    per_ip: Table,
+    global: Counter,
 }
 
-/// Wrong-passphrase limiter: per address, the third failure locks that address for
-/// 10 s, doubling with each further failure (cap 15 min); 30 failures from anywhere in
-/// 15 minutes lock everyone out until the window drains.
-#[derive(Default)]
+/// Wrong-passphrase limiter. An attempt is *reserved* (counted as a failure) atomically
+/// before any hashing happens and refunded on success, so concurrent guesses cannot
+/// outrun the caps. Per address (keyed by [`ratelimit::key`]): the third failure locks it
+/// for 10 s, doubling with each further one (cap 15 min). Failures from anywhere only add
+/// an escalating delay (up to 30 s) to *failed* responses; they never lock the owner out.
 pub struct PassphraseLimiter {
     st: Mutex<PwState>,
+    delay_cap_ms: std::sync::atomic::AtomicU64,
+}
+
+impl Default for PassphraseLimiter {
+    fn default() -> Self {
+        Self {
+            st: Mutex::new(PwState {
+                per_ip: Table::new(PW_WINDOW, Expiry::Idle, MAX_TRACKED),
+                global: Counter::new(Instant::now()),
+            }),
+            delay_cap_ms: PW_DELAY_CAP_MS.into(),
+        }
+    }
 }
 
 impl PassphraseLimiter {
@@ -175,64 +219,83 @@ impl PassphraseLimiter {
         self.st.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// `Err(wait)` if the attempt must be refused now.
-    pub fn check(&self, ip: IpAddr) -> Result<(), Duration> {
+    /// Reserve one attempt (counted as a failure until [`Self::success`]). `Err(wait)` if
+    /// this address is currently locked out.
+    pub fn reserve(&self, ip: IpAddr) -> Result<(), Duration> {
         let mut s = self.lock();
         let now = Instant::now();
-        s.global.retain(|t| now.duration_since(*t) < PW_WINDOW);
-        if s.global.len() >= PW_GLOBAL_MAX {
-            let oldest = s.global.first().copied().unwrap_or(now);
-            return Err(PW_WINDOW.saturating_sub(now.duration_since(oldest)));
-        }
-        if let Some(e) = s.per_ip.get(&ip) {
-            if now.duration_since(e.last) >= PW_WINDOW {
-                s.per_ip.remove(&ip);
-            } else if e.count >= PW_FREE {
-                let exp = (e.count - PW_FREE).min(7);
-                let lock = Duration::from_secs((10u64 << exp).min(900));
-                let since = now.duration_since(e.last);
-                if since < lock {
-                    return Err(lock - since);
-                }
+        if let Some(e) = s.per_ip.get(ip, now)
+            && e.count >= PW_FREE
+        {
+            let exp = (e.count - PW_FREE).min(7);
+            let lock = Duration::from_secs((10u64 << exp).min(900));
+            let since = now.saturating_duration_since(e.last);
+            if since < lock {
+                return Err(lock - since);
             }
         }
+        s.per_ip.hit(ip, now);
+        s.global.hit(now, PW_WINDOW, Expiry::Fixed);
         Ok(())
     }
 
-    pub fn failure(&self, ip: IpAddr) {
+    /// The reserved attempt was never evaluated (server busy): do not count it.
+    pub fn release(&self, ip: IpAddr) {
         let mut s = self.lock();
-        let now = Instant::now();
-        if s.per_ip.len() > 10_000 {
-            s.per_ip
-                .retain(|_, e| now.duration_since(e.last) < PW_WINDOW);
-        }
-        s.global.push(now);
-        let e = s.per_ip.entry(ip).or_insert(IpFails {
-            count: 0,
-            last: now,
-        });
-        e.count += 1;
-        e.last = now;
+        s.per_ip.unhit(ip);
+        s.global.count = s.global.count.saturating_sub(1);
     }
 
+    /// Correct passphrase: refund the reservation and clear this address.
     pub fn success(&self, ip: IpAddr) {
-        self.lock().per_ip.remove(&ip);
+        let mut s = self.lock();
+        s.per_ip.remove(ip);
+        s.global.count = s.global.count.saturating_sub(1);
+    }
+
+    /// Delay to add to a failed response, growing with the global failure count.
+    pub fn delay(&self) -> Duration {
+        let s = self.lock();
+        let n = if s.global.expired(Instant::now(), PW_WINDOW, Expiry::Fixed) {
+            0
+        } else {
+            s.global.count
+        };
+        let cap = self.delay_cap_ms.load(std::sync::atomic::Ordering::Relaxed);
+        Duration::from_millis(
+            (PW_DELAY_STEP_MS * u64::from(n.saturating_sub(PW_GLOBAL_FREE))).min(cap),
+        )
+    }
+
+    #[cfg(test)]
+    fn set_delay_cap(&self, d: Duration) {
+        self.delay_cap_ms
+            .store(d.as_millis() as u64, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
 const REG_WINDOW: Duration = Duration::from_secs(3600);
-const REG_PER_IP: usize = 10;
-const REG_GLOBAL: usize = 100;
+const REG_PER_IP: u32 = 10;
+const REG_GLOBAL: u32 = 100;
 
-#[derive(Default)]
 struct RegState {
-    per_ip: HashMap<IpAddr, Vec<Instant>>,
-    global: Vec<Instant>,
+    per_ip: Table,
+    global: Counter,
 }
 
-#[derive(Default)]
 struct RegistrationLimiter {
     st: Mutex<RegState>,
+}
+
+impl Default for RegistrationLimiter {
+    fn default() -> Self {
+        Self {
+            st: Mutex::new(RegState {
+                per_ip: Table::new(REG_WINDOW, Expiry::Fixed, MAX_TRACKED),
+                global: Counter::new(Instant::now()),
+            }),
+        }
+    }
 }
 
 impl RegistrationLimiter {
@@ -240,23 +303,39 @@ impl RegistrationLimiter {
     fn hit(&self, ip: IpAddr) -> bool {
         let mut g = self.st.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
-        let RegState { per_ip, global } = &mut *g;
-        global.retain(|t| now.duration_since(*t) < REG_WINDOW);
-        if per_ip.len() > 10_000 {
-            per_ip.retain(|_, v| {
-                v.last()
-                    .is_some_and(|t| now.duration_since(*t) < REG_WINDOW)
-            });
-        }
-        let v = per_ip.entry(ip).or_default();
-        v.retain(|t| now.duration_since(*t) < REG_WINDOW);
-        if v.len() >= REG_PER_IP || global.len() >= REG_GLOBAL {
+        let ip_n = g.per_ip.get(ip, now).map_or(0, |c| c.count);
+        let glob_n = if g.global.expired(now, REG_WINDOW, Expiry::Fixed) {
+            0
+        } else {
+            g.global.count
+        };
+        if ip_n >= REG_PER_IP || glob_n >= REG_GLOBAL {
             return false;
         }
-        v.push(now);
-        global.push(now);
+        g.per_ip.hit(ip, now);
+        g.global.hit(now, REG_WINDOW, Expiry::Fixed);
         true
     }
+}
+
+/// Failures allowed per address on `/token` and `/revoke` per window.
+const TOKEN_MAX_FAILURES: u32 = 20;
+
+/// HMAC-SHA256 (RFC 2104), keyed with the per-process CSRF secret.
+fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
+    let mut k = [0u8; 64];
+    if key.len() > 64 {
+        k[..32].copy_from_slice(&Sha256::digest(key));
+    } else {
+        k[..key.len()].copy_from_slice(key);
+    }
+    let mut inner = Sha256::new();
+    inner.update(k.map(|b| b ^ 0x36));
+    inner.update(msg);
+    let mut outer = Sha256::new();
+    outer.update(k.map(|b| b ^ 0x5c));
+    outer.update(inner.finalize());
+    outer.finalize().into()
 }
 
 // ---- small helpers -------------------------------------------------------------------
@@ -404,7 +483,8 @@ fn escape(s: &str) -> String {
             '>' => o.push_str("&gt;"),
             '"' => o.push_str("&quot;"),
             '\'' => o.push_str("&#39;"),
-            c if c.is_control() => {}
+            // kept, as a character reference: values echoed to the client must stay exact
+            c if c.is_control() => o.push_str(&format!("&#{};", c as u32)),
             c => o.push(c),
         }
     }
@@ -452,11 +532,10 @@ async fn authorization_server(State(s): State<OAuthState>) -> Response {
     let i = &s.cfg.issuer;
     // `client_id_metadata_document_supported` is deliberately absent: advertising it
     // makes Claude use CIMD, which would require fetching client-supplied URLs.
-    Json(json!({
+    let mut meta = json!({
         "issuer": i,
         "authorization_endpoint": format!("{i}/authorize"),
         "token_endpoint": format!("{i}/token"),
-        "registration_endpoint": format!("{i}/register"),
         "revocation_endpoint": format!("{i}/revoke"),
         "response_types_supported": ["code"],
         "response_modes_supported": ["query"],
@@ -466,8 +545,11 @@ async fn authorization_server(State(s): State<OAuthState>) -> Response {
         "revocation_endpoint_auth_methods_supported": ["none"],
         "scopes_supported": ["warden", "offline_access"],
         "authorization_response_iss_parameter_supported": true,
-    }))
-    .into_response()
+    });
+    if s.cfg.registration_open {
+        meta["registration_endpoint"] = json!(format!("{i}/register"));
+    }
+    Json(meta).into_response()
 }
 
 // ---- dynamic client registration (RFC 7591) ----------------------------------------------
@@ -478,6 +560,13 @@ async fn register(
     Json(body): Json<Value>,
 ) -> Response {
     let reg_err = |code: &str, desc: &str| oauth_error(StatusCode::BAD_REQUEST, code, desc);
+    if !s.cfg.registration_open {
+        return oauth_error(
+            StatusCode::FORBIDDEN,
+            "access_denied",
+            "dynamic client registration is closed on this server",
+        );
+    }
     if !s.registrations.hit(ip) {
         let mut r = oauth_error(
             StatusCode::TOO_MANY_REQUESTS,
@@ -534,11 +623,15 @@ async fn register(
     {
         Ok(true) => {}
         Ok(false) => {
-            return oauth_error(
+            tracing::warn!("oauth register: client registry full, nothing evictable");
+            let mut r = oauth_error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "temporarily_unavailable",
-                "client registry is full",
+                "client registry is full, try again later",
             );
+            r.headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from(900));
+            return r;
         }
         Err(e) => {
             tracing::error!("oauth register: {e}");
@@ -559,9 +652,11 @@ async fn register(
     )
 }
 
-/// Insert a client, pruning first. Returns false when the registry is full of clients
-/// that hold tokens (clients that never completed a flow are evicted oldest-first, so
-/// an anonymous registration flood cannot displace the owner's connections).
+/// Insert a client, pruning first. When the registry is full only a client that is
+/// older than [`CLIENT_MIN_AGE_SECS`] *and* never obtained a token (no token rows, never
+/// used) may be evicted, oldest first; if there is none the registration is refused
+/// (returns false) rather than displacing anyone, so a registration flood can neither
+/// push out the owner's pending or connected clients nor be absorbed by evicting them.
 fn register_client(
     c: &mut rusqlite::Connection,
     client_id: &str,
@@ -576,10 +671,9 @@ fn register_client(
             break;
         }
         let gone = tx.execute(
-            "DELETE FROM oauth_clients WHERE client_id = (\
-               SELECT client_id FROM oauth_clients c \
-               WHERE NOT EXISTS (SELECT 1 FROM oauth_tokens t WHERE t.client_id = c.client_id) \
-               ORDER BY created_at, rowid LIMIT 1)",
+            &format!(
+                "DELETE FROM oauth_clients WHERE client_id = (                   SELECT client_id FROM oauth_clients c                    WHERE c.last_used_at IS NULL                      AND c.created_at < strftime('%Y-%m-%dT%H:%M:%SZ','now','-{CLIENT_MIN_AGE_SECS} seconds')                      AND NOT EXISTS (SELECT 1 FROM oauth_tokens t WHERE t.client_id = c.client_id)                    ORDER BY created_at, rowid LIMIT 1)"
+            ),
             [],
         )?;
         if gone == 0 {
@@ -588,8 +682,7 @@ fn register_client(
     }
     tx.execute(
         &format!(
-            "INSERT INTO oauth_clients (client_id, client_name, redirect_uris, created_at) \
-             VALUES (?1, ?2, ?3, {NOW})"
+            "INSERT INTO oauth_clients (client_id, client_name, redirect_uris, created_at)              VALUES (?1, ?2, ?3, {NOW})"
         ),
         params![client_id, name, uris_json],
     )?;
@@ -647,6 +740,9 @@ struct Validated {
     client_id: String,
     client_name: Option<String>,
     redirect: Url,
+    /// The `redirect_uri` exactly as the client sent it (and as it was registered, modulo a
+    /// loopback port). Codes store and `/token` compares this string, not the normalized `Url`.
+    redirect_raw: String,
     state: Option<String>,
     challenge: String,
     scope: String,
@@ -806,6 +902,7 @@ async fn validate_authorize(s: &OAuthState, p: &AuthParams) -> Result<Validated,
         client_id,
         client_name,
         redirect,
+        redirect_raw: redirect_str.to_owned(),
         state: p.state.clone(),
         challenge,
         scope: scope.to_owned(),
@@ -875,7 +972,7 @@ fn consent_html(
     let mut hid = String::new();
     for (n, val) in [
         ("client_id", v.client_id.as_str()),
-        ("redirect_uri", v.redirect.as_str()),
+        ("redirect_uri", v.redirect_raw.as_str()),
         ("response_type", "code"),
         ("code_challenge", &v.challenge),
         ("code_challenge_method", "S256"),
@@ -897,7 +994,7 @@ fn consent_html(
          {warn}{err}\
          <form method=post action=\"/authorize\">{hid}\
          <label>Owner passphrase<input type=password name=passphrase autocomplete=current-password required autofocus></label>\
-         <label>Connection name <small>(its own unread-CVE cursor; letters, digits, . _ -)</small>\
+         <label>Connection name <small>(letters, digits, . _ -). Tools use it as the unread-CVE cursor named <b>oauth:</b><i>name</i>, e.g. <b>oauth:{label_hint}</b>.</small>\
          <input type=text name=label value=\"{label}\" maxlength=48 pattern=\"[A-Za-z0-9._\\-]{{1,48}}\"></label>\
          <button type=submit>Authorize</button><button type=submit name=deny value=1 formnovalidate>Deny</button></form>",
         name = escape(v.client_name.as_deref().unwrap_or("(unnamed client)")),
@@ -911,6 +1008,7 @@ fn consent_html(
             .map(|e| format!("<p class=err>{}</p>", escape(e)))
             .unwrap_or_default(),
         label = escape(label),
+        label_hint = escape(label),
     )
 }
 
@@ -924,9 +1022,52 @@ fn cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
         .find_map(|(k, v)| (k == name).then_some(v))
 }
 
+const CSRF_TTL_SECS: u64 = 900;
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// `nonce.expiry.mac` where `mac = HMAC-SHA256(secret, nonce|client_id|expiry)`.
+fn csrf_mac(s: &OAuthState, nonce: &str, client_id: &str, expiry: u64) -> String {
+    URL_SAFE_NO_PAD.encode(hmac_sha256(
+        &s.csrf_secret[..],
+        format!("warden-csrf|{nonce}|{client_id}|{expiry}").as_bytes(),
+    ))
+}
+
+fn csrf_token(s: &OAuthState, client_id: &str) -> Result<String> {
+    let nonce = generate_key()?;
+    let expiry = unix_now() + CSRF_TTL_SECS;
+    Ok(format!(
+        "{nonce}.{expiry}.{}",
+        csrf_mac(s, &nonce, client_id, expiry)
+    ))
+}
+
+/// Server-side check of a CSRF token: well-formed, unexpired, MAC valid for this client.
+fn csrf_valid(s: &OAuthState, token: &str, client_id: &str) -> bool {
+    let mut it = token.split('.');
+    let (Some(nonce), Some(exp), Some(mac), None) = (it.next(), it.next(), it.next(), it.next())
+    else {
+        return false;
+    };
+    let Ok(expiry) = exp.parse::<u64>() else {
+        return false;
+    };
+    expiry >= unix_now()
+        && bool::from(
+            csrf_mac(s, nonce, client_id, expiry)
+                .as_bytes()
+                .ct_eq(mac.as_bytes()),
+        )
+}
+
 fn csrf_cookie(s: &OAuthState, token: &str) -> String {
     format!(
-        "warden_csrf={token}; Path=/authorize; Max-Age=900; HttpOnly; SameSite=Strict{}",
+        "warden_csrf={token}; Path=/authorize; Max-Age={CSRF_TTL_SECS}; HttpOnly; SameSite=Strict{}",
         if s.cfg.secure_cookie { "; Secure" } else { "" }
     )
 }
@@ -936,7 +1077,7 @@ async fn authorize_get(State(s): State<OAuthState>, Query(p): Query<AuthParams>)
         Ok(v) => v,
         Err(e) => return e.into_response(&s),
     };
-    let Ok(csrf) = generate_key() else {
+    let Ok(csrf) = csrf_token(&s, &v.client_id) else {
         return internal_error();
     };
     page(
@@ -952,10 +1093,13 @@ async fn authorize_post(
     headers: HeaderMap,
     Form(p): Form<AuthParams>,
 ) -> Response {
-    // CSRF first: double-submit cookie. Failures do not count against the passphrase limiter.
+    // CSRF first: the cookie must equal the form field (double submit) and the token must
+    // carry a valid server MAC for this client and not be expired. Failures do not count
+    // against the passphrase limiter.
     let form_tok = p.csrf.as_deref().unwrap_or("");
     let ok = cookie_value(&headers, "warden_csrf")
-        .is_some_and(|c| !c.is_empty() && bool::from(c.as_bytes().ct_eq(form_tok.as_bytes())));
+        .is_some_and(|c| !c.is_empty() && bool::from(c.as_bytes().ct_eq(form_tok.as_bytes())))
+        && csrf_valid(&s, form_tok, p.client_id.as_deref().unwrap_or(""));
     if !ok {
         return page(
             StatusCode::FORBIDDEN,
@@ -980,7 +1124,9 @@ async fn authorize_post(
             ],
         );
     }
-    if let Err(wait) = s.passphrases.check(ip) {
+    // Reserve the attempt (counted as a failure) BEFORE hashing so parallel guesses cannot
+    // outrun the caps; refunded below on success.
+    if let Err(wait) = s.passphrases.reserve(ip) {
         let mut r = page(
             StatusCode::TOO_MANY_REQUESTS,
             &error_html("Too many failed attempts. Wait a while and try again."),
@@ -992,17 +1138,38 @@ async fn authorize_post(
         );
         return r;
     }
+    let Ok(Ok(permit)) = tokio::time::timeout(ARGON_WAIT, s.argon.clone().acquire_owned()).await
+    else {
+        s.passphrases.release(ip);
+        let mut r = page(
+            StatusCode::TOO_MANY_REQUESTS,
+            &error_html("The server is busy checking other attempts. Try again in a moment."),
+            None,
+        );
+        r.headers_mut()
+            .insert(header::RETRY_AFTER, HeaderValue::from(5));
+        return r;
+    };
     let (hash, pw) = (
         s.cfg.passphrase_hash.clone(),
         p.passphrase.clone().unwrap_or_default(),
     );
-    let ok = tokio::task::spawn_blocking(move || verify_passphrase(&hash, &pw))
-        .await
-        .unwrap_or(false);
+    // The permit moves into the blocking task: it is held for exactly as long as the
+    // hash runs, even if this request is dropped (timeout, client disconnect).
+    let ok = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        verify_passphrase(&hash, &pw)
+    })
+    .await
+    .unwrap_or(false);
     let label_in = p.label.as_deref().map(str::trim).filter(|l| !l.is_empty());
     if !ok {
-        s.passphrases.failure(ip);
         tracing::warn!(%ip, client = %v.client_id, "oauth consent: wrong passphrase");
+        // Failed responses slow down as global failures pile up (never a hard lockout).
+        let delay = s.passphrases.delay();
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
         return page(
             StatusCode::UNAUTHORIZED,
             &consent_html(
@@ -1015,6 +1182,8 @@ async fn authorize_post(
             None,
         );
     }
+    // Correct passphrase: refund the reservation (a bad label below is not a guess).
+    s.passphrases.success(ip);
     let label = match label_in {
         Some(l) if valid_label(l) => l.to_owned(),
         Some(_) => {
@@ -1032,7 +1201,6 @@ async fn authorize_post(
         }
         None => v.default_label.clone(),
     };
-    s.passphrases.success(ip);
     let (code, family) = match (generate_key(), generate_key()) {
         (Ok(c), Ok(f)) => (c, f),
         _ => return internal_error(),
@@ -1040,7 +1208,7 @@ async fn authorize_post(
     let (ch, cid, ru, chal, res, scope, lab) = (
         hash_key(&code),
         v.client_id.clone(),
-        v.redirect.to_string(),
+        v.redirect_raw.clone(),
         v.challenge.clone(),
         v.resource.clone(),
         v.scope.clone(),
@@ -1317,7 +1485,35 @@ fn exchange_refresh(
     Ok(Ok(issued))
 }
 
-async fn token(State(s): State<OAuthState>, Form(p): Form<TokenParams>) -> Response {
+fn too_many_token_requests(s: &OAuthState) -> Response {
+    let mut r = oauth_error(
+        StatusCode::TOO_MANY_REQUESTS,
+        "temporarily_unavailable",
+        "too many failed requests from this address, try again later",
+    );
+    r.headers_mut().insert(
+        header::RETRY_AFTER,
+        HeaderValue::from(s.token_failures.window().as_secs()),
+    );
+    r
+}
+
+async fn token(
+    State(s): State<OAuthState>,
+    Extension(ClientIp(ip)): Extension<ClientIp>,
+    Form(p): Form<TokenParams>,
+) -> Response {
+    if s.token_failures.blocked(ip) {
+        return too_many_token_requests(&s);
+    }
+    let r = token_inner(&s, p).await;
+    if r.status().is_client_error() {
+        s.token_failures.record_failure(ip);
+    }
+    r
+}
+
+async fn token_inner(s: &OAuthState, p: TokenParams) -> Response {
     if p.resource.as_deref().is_some_and(|r| r != s.cfg.resource) {
         return oauth_error(
             StatusCode::BAD_REQUEST,
@@ -1364,8 +1560,18 @@ async fn token(State(s): State<OAuthState>, Form(p): Form<TokenParams>) -> Respo
 }
 
 /// RFC 7009: revoke the presented token's whole family. Always 200 (no oracle).
-async fn revoke(State(s): State<OAuthState>, Form(p): Form<TokenParams>) -> Response {
-    if let Some(t) = p.token {
+async fn revoke(
+    State(s): State<OAuthState>,
+    Extension(ClientIp(ip)): Extension<ClientIp>,
+    Form(p): Form<TokenParams>,
+) -> Response {
+    if s.token_failures.blocked(ip) {
+        return too_many_token_requests(&s);
+    }
+    // A request that revokes nothing (no token, wrong shape, unknown token) counts as a
+    // failure for the per-address limiter; the answer stays 200 either way (no oracle).
+    let mut found = false;
+    if let Some(t) = p.token.filter(|t| token_shaped(t)) {
         let h = hash_key(&t);
         let r =
             s.db.call(move |c| {
@@ -1376,16 +1582,25 @@ async fn revoke(State(s): State<OAuthState>, Form(p): Form<TokenParams>) -> Resp
                         |r| r.get(0),
                     )
                     .optional()?;
-                if let Some(f) = fam {
-                    revoke_family(c, &f)?;
+                match fam {
+                    Some(f) => {
+                        revoke_family(c, &f)?;
+                        Ok(true)
+                    }
+                    None => Ok(false),
                 }
-                Ok(())
             })
             .await;
-        if let Err(e) = r {
-            tracing::error!("oauth revoke: {e}");
-            return internal_error();
+        match r {
+            Ok(f) => found = f,
+            Err(e) => {
+                tracing::error!("oauth revoke: {e}");
+                return internal_error();
+            }
         }
+    }
+    if !found {
+        s.token_failures.record_failure(ip);
     }
     json_response(StatusCode::OK, json!({}))
 }
@@ -1399,10 +1614,14 @@ pub struct OAuthValidator {
 }
 
 impl TokenValidator for OAuthValidator {
+    fn needs_db(&self) -> bool {
+        true
+    }
+
     fn validate<'a>(&'a self, token: &'a str) -> ValidateFuture<'a> {
         Box::pin(async move {
             // Cheap shape check: tokens are 32 random bytes, base64url.
-            if token.len() != 43 {
+            if !token_shaped(token) {
                 return None;
             }
             let (h, res) = (hash_key(token), self.resource.clone());
@@ -1444,6 +1663,7 @@ pub fn from_config(db: Db, config: &crate::config::Config) -> Result<Option<OAut
             redirect_allow: config.oauth_redirect_allow.clone(),
             refresh_ttl_secs: config.oauth_refresh_days * 86_400,
             secure_cookie: config.public_url.starts_with("https://"),
+            registration_open: config.oauth_registration_open,
         },
     )))
 }
@@ -1457,7 +1677,7 @@ mod tests {
         http,
     };
     use axum::{body::Body, extract::ConnectInfo, http::Request};
-    use std::net::SocketAddr;
+    use std::{collections::HashMap, net::SocketAddr};
     use tower::ServiceExt;
 
     const PASS: &str = "correct horse battery staple";
@@ -1472,9 +1692,14 @@ mod tests {
     struct T {
         app: Router,
         db: Db,
+        o: OAuthState,
     }
 
     fn setup_with(cfg: Config) -> T {
+        setup_full(cfg, true)
+    }
+
+    fn setup_full(cfg: Config, registration_open: bool) -> T {
         let hash = Argon2::default()
             .hash_password(PASS.as_bytes())
             .unwrap()
@@ -1493,17 +1718,20 @@ mod tests {
                     .collect(),
                 refresh_ttl_secs: 30 * 86_400,
                 secure_cookie: false,
+                registration_open,
             },
         );
+        o.passphrases.set_delay_cap(Duration::from_millis(20));
         st.validators = vec![
             Arc::new(ApiKeyValidator::parse(&[format!("k:{}", hk("static-key"))]).unwrap()),
             Arc::new(o.validator()),
         ];
-        st.oauth = Some(o);
+        st.oauth = Some(o.clone());
         let db = st.db.clone();
         T {
             app: http::router(st),
             db,
+            o,
         }
     }
 
@@ -1801,28 +2029,79 @@ mod tests {
             assert_eq!(st, StatusCode::BAD_REQUEST, "{bad}");
             assert_eq!(v["error"], "invalid_redirect_uri");
         }
-        // Registry cap: never-authorized clients are evicted oldest first, and a client
-        // that holds tokens survives a registration flood.
+        // Registry cap: young clients are never evicted, so once full the flood is refused
+        // (503) rather than displacing anyone; the client holding tokens survives.
         let (cid, _) = authed(&t).await;
-        for i in 0..60 {
+        let mut created = 0;
+        for i in 0..70 {
             let r = req("POST", "/register")
                 .header("content-type", "application/json")
                 .body(Body::from(json!({"redirect_uris": [CB]}).to_string()))
                 .unwrap();
-            let (st, ..) = send(&t, r, &format!("198.51.100.{}", i % 250)).await;
-            assert_eq!(st, StatusCode::CREATED);
+            let (st, h, _) = send(&t, r, &format!("198.51.{}.{}", i / 250, i % 250 + 1)).await;
+            match st {
+                StatusCode::CREATED => created += 1,
+                StatusCode::SERVICE_UNAVAILABLE => assert!(h.contains_key(header::RETRY_AFTER)),
+                other => panic!("unexpected {other}"),
+            }
         }
-        assert!(count(&t, "SELECT COUNT(*) FROM oauth_clients") <= MAX_CLIENTS);
-        let kept: i64 =
-            t.db.with_conn(|c| {
+        assert_eq!(count(&t, "SELECT COUNT(*) FROM oauth_clients"), MAX_CLIENTS);
+        assert!(created > 0 && created < 70, "{created}");
+        let has = |t: &T, cid: &str| -> i64 {
+            let cid = cid.to_owned();
+            t.db.with_conn(move |c| {
                 Ok(c.query_row(
                     "SELECT COUNT(*) FROM oauth_clients WHERE client_id = ?1",
                     [&cid],
                     |r| r.get(0),
                 )?)
             })
+            .unwrap()
+        };
+        assert_eq!(has(&t, &cid), 1);
+        // Once the never-used clients are older than the minimum age they can be evicted
+        // (oldest first); the token holder still survives.
+        sql(
+            &t,
+            "UPDATE oauth_clients SET created_at = strftime('%Y-%m-%dT%H:%M:%SZ','now','-2 hours') WHERE last_used_at IS NULL",
+        );
+        let r = req("POST", "/register")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"redirect_uris": [CB]}).to_string()))
             .unwrap();
-        assert_eq!(kept, 1);
+        assert_eq!(send(&t, r, "192.0.2.200").await.0, StatusCode::CREATED);
+        assert_eq!(count(&t, "SELECT COUNT(*) FROM oauth_clients"), MAX_CLIENTS);
+        assert_eq!(has(&t, &cid), 1);
+    }
+
+    #[tokio::test]
+    async fn registration_can_be_closed() {
+        let t = setup_full(Config::from_lookup(|_| None).unwrap(), false);
+        let r = req("POST", "/register")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"redirect_uris": [CB]}).to_string()))
+            .unwrap();
+        let (st, _, body) = send(&t, r, "192.0.2.9").await;
+        assert_eq!(st, StatusCode::FORBIDDEN);
+        assert!(body.contains("access_denied"), "{body}");
+        let (_, _, meta) = send(
+            &t,
+            req("GET", "/.well-known/oauth-authorization-server")
+                .body(Body::empty())
+                .unwrap(),
+            "192.0.2.9",
+        )
+        .await;
+        let meta: Value = serde_json::from_str(&meta).unwrap();
+        assert!(meta.get("registration_endpoint").is_none());
+        assert!(meta.get("authorization_endpoint").is_some());
+        // config parsing
+        let cfg = |v: &'static str| {
+            Config::from_lookup(move |k| (k == "WARDEN_OAUTH_REGISTRATION").then(|| v.to_owned()))
+        };
+        assert!(!cfg("closed").unwrap().oauth_registration_open);
+        assert!(cfg("open").unwrap().oauth_registration_open);
+        assert!(cfg("maybe").is_err());
     }
 
     #[tokio::test]
@@ -2211,21 +2490,270 @@ mod tests {
     }
 
     #[test]
-    fn limiter_global_lockout_and_backoff() {
-        let l = PassphraseLimiter::default();
-        for i in 0..PW_GLOBAL_MAX {
-            l.failure(format!("10.0.{}.{}", i / 200, i % 200 + 1).parse().unwrap());
-        }
-        assert!(l.check("192.0.2.1".parse().unwrap()).is_err());
+    fn limiter_backoff_refund_and_no_global_lockout() {
         let l = PassphraseLimiter::default();
         let ip: IpAddr = "192.0.2.1".parse().unwrap();
-        l.failure(ip);
-        l.failure(ip);
-        assert!(l.check(ip).is_ok());
-        l.failure(ip);
-        assert!(l.check(ip).is_err());
+        assert!(l.reserve(ip).is_ok());
+        assert!(l.reserve(ip).is_ok());
+        assert!(l.reserve(ip).is_ok());
+        assert!(l.reserve(ip).is_err(), "third failure locks the address");
         l.success(ip);
-        assert!(l.check(ip).is_ok());
+        assert!(l.reserve(ip).is_ok());
+        // a busy server does not count the attempt
+        let busy: IpAddr = "192.0.2.2".parse().unwrap();
+        for _ in 0..10 {
+            assert!(l.reserve(busy).is_ok());
+            l.release(busy);
+        }
+        // failures from many addresses slow responses (capped) but never lock anyone out
+        let l = PassphraseLimiter::default();
+        for i in 0..200u32 {
+            let ip: IpAddr = format!("10.{}.{}.1", i / 200, i % 200).parse().unwrap();
+            assert!(l.reserve(ip).is_ok());
+        }
+        assert_eq!(l.delay(), Duration::from_millis(PW_DELAY_CAP_MS));
+        assert!(l.reserve("192.0.2.99".parse().unwrap()).is_ok());
+        // IPv6 addresses of one /64 share a bucket
+        let l = PassphraseLimiter::default();
+        for i in 0..PW_FREE {
+            assert!(
+                l.reserve(format!("2001:db8:0:1::{i:x}").parse().unwrap())
+                    .is_ok()
+            );
+        }
+        assert!(l.reserve("2001:db8:0:1:aaaa::1".parse().unwrap()).is_err());
+        assert!(l.reserve("2001:db8:0:2::1".parse().unwrap()).is_ok());
+    }
+
+    #[test]
+    fn concurrent_reservations_cannot_exceed_the_cap() {
+        let l = Arc::new(PassphraseLimiter::default());
+        let ip: IpAddr = "198.51.100.1".parse().unwrap();
+        let handles: Vec<_> = (0..400)
+            .map(|_| {
+                let l = l.clone();
+                std::thread::spawn(move || l.reserve(ip).is_ok())
+            })
+            .collect();
+        let granted = handles
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .filter(|ok| *ok)
+            .count();
+        assert_eq!(granted as u32, PW_FREE);
+    }
+
+    /// Run futures concurrently on the current task (no extra dependency).
+    async fn join_all<F: std::future::Future>(futs: Vec<F>) -> Vec<F::Output> {
+        let mut set: Vec<_> = futs.into_iter().map(Box::pin).collect();
+        let mut out: Vec<Option<F::Output>> = set.iter().map(|_| None).collect();
+        std::future::poll_fn(|cx| {
+            let mut pending = false;
+            for (i, f) in set.iter_mut().enumerate() {
+                if out[i].is_none() {
+                    match f.as_mut().poll(cx) {
+                        std::task::Poll::Ready(v) => out[i] = Some(v),
+                        std::task::Poll::Pending => pending = true,
+                    }
+                }
+            }
+            if pending {
+                std::task::Poll::Pending
+            } else {
+                std::task::Poll::Ready(())
+            }
+        })
+        .await;
+        out.into_iter().map(Option::unwrap).collect()
+    }
+
+    #[tokio::test]
+    async fn parallel_guesses_are_bounded_and_owner_still_gets_in() {
+        let t = setup();
+        let cid = client(&t).await;
+        let chal = challenge(VERIFIER);
+        let (csrf, ..) = consent(&t, &authorize_query(&cid, CB, &chal, &[])).await;
+        // 60 parallel wrong guesses from one address: at most PW_FREE reach the hash.
+        let futs: Vec<_> = (0..60)
+            .map(|_| post_consent(&t, &cid, &chal, Some(&csrf), "wrong", "", "198.51.100.5"))
+            .collect();
+        let res = join_all(futs).await;
+        let evaluated = res
+            .iter()
+            .filter(|(st, ..)| *st == StatusCode::UNAUTHORIZED)
+            .count();
+        let refused = res
+            .iter()
+            .filter(|(st, ..)| *st == StatusCode::TOO_MANY_REQUESTS)
+            .count();
+        assert_eq!(evaluated as u32, PW_FREE, "evaluated {evaluated}");
+        assert_eq!(evaluated + refused, 60);
+        // a burst of failures from many other addresses must not lock the owner out
+        for i in 0..(PW_GLOBAL_FREE + 6) {
+            let ip = format!("203.0.114.{}", i + 1);
+            let (st, ..) = post_consent(&t, &cid, &chal, Some(&csrf), "wrong", "", &ip).await;
+            assert_eq!(st, StatusCode::UNAUTHORIZED);
+        }
+        assert!(t.o.passphrases.delay() > Duration::ZERO);
+        let (st, ..) = post_consent(&t, &cid, &chal, Some(&csrf), PASS, "", "192.0.2.77").await;
+        assert_eq!(st, StatusCode::FOUND);
+    }
+
+    #[tokio::test]
+    async fn argon_semaphore_bounds_concurrent_evaluations() {
+        let t = setup();
+        // Hold every permit: a new attempt is refused as busy and is not counted as a failure.
+        let _held =
+            t.o.argon
+                .clone()
+                .acquire_many_owned(ARGON_PERMITS as u32)
+                .await
+                .unwrap();
+        let cid = client(&t).await;
+        let chal = challenge(VERIFIER);
+        let (csrf, ..) = consent(&t, &authorize_query(&cid, CB, &chal, &[])).await;
+        let started = Instant::now();
+        let (st, h, _) = post_consent(&t, &cid, &chal, Some(&csrf), PASS, "", "198.51.100.9").await;
+        assert_eq!(st, StatusCode::TOO_MANY_REQUESTS);
+        assert!(h.contains_key(header::RETRY_AFTER));
+        assert!(started.elapsed() >= ARGON_WAIT);
+        assert!(
+            t.o.passphrases
+                .reserve("198.51.100.9".parse().unwrap())
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn csrf_token_is_verified_server_side() {
+        let t = setup();
+        let cid = client(&t).await;
+        let chal = challenge(VERIFIER);
+        let (csrf, ..) = consent(&t, &authorize_query(&cid, CB, &chal, &[])).await;
+        assert!(csrf_valid(&t.o, &csrf, &cid));
+        assert!(!csrf_valid(&t.o, &csrf, "another-client"));
+        let mut parts: Vec<&str> = csrf.split('.').collect();
+        // a forged MAC with an attacker-chosen cookie/form pair is refused
+        parts[2] = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let forged = parts.join(".");
+        let (st, ..) = post_consent(&t, &cid, &chal, Some(&forged), PASS, "", "203.0.113.2").await;
+        assert_eq!(st, StatusCode::FORBIDDEN);
+        // an attacker-chosen plain value (what the old double-submit accepted) too
+        let (st, ..) =
+            post_consent(&t, &cid, &chal, Some("attacker"), PASS, "", "203.0.113.2").await;
+        assert_eq!(st, StatusCode::FORBIDDEN);
+        // expired
+        let nonce = "n".repeat(43);
+        let exp = unix_now() - 1;
+        let old = format!("{nonce}.{exp}.{}", csrf_mac(&t.o, &nonce, &cid, exp));
+        assert!(!csrf_valid(&t.o, &old, &cid));
+        // a token from another server instance (different secret) is refused
+        let other = setup();
+        assert!(!csrf_valid(&other.o, &csrf, &cid));
+    }
+
+    #[tokio::test]
+    async fn token_and_revoke_failures_are_limited_per_address() {
+        let t = setup();
+        let ip = "198.51.100.200";
+        async fn bad_token(t: &T, ip: &str) -> (StatusCode, HeaderMap, String) {
+            let r = req("POST", "/token")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(form(&[("grant_type", "password")])))
+                .unwrap();
+            send(t, r, ip).await
+        }
+        for _ in 0..TOKEN_MAX_FAILURES {
+            assert_eq!(bad_token(&t, ip).await.0, StatusCode::BAD_REQUEST);
+        }
+        let (st, h, body) = bad_token(&t, ip).await;
+        assert_eq!(st, StatusCode::TOO_MANY_REQUESTS);
+        assert!(h.contains_key(header::RETRY_AFTER) && body.contains("temporarily_unavailable"));
+        // /revoke shares the budget and is refused too; other addresses are unaffected
+        let rv = || {
+            req("POST", "/revoke")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(form(&[("token", "nope")])))
+                .unwrap()
+        };
+        assert_eq!(send(&t, rv(), ip).await.0, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(send(&t, rv(), "198.51.100.201").await.0, StatusCode::OK);
+        // a legitimate exchange from a clean address still works
+        let (_, v) = authed(&t).await;
+        assert_eq!(v["token_type"], "Bearer");
+    }
+
+    #[tokio::test]
+    async fn pathless_redirect_uri_round_trips_exactly() {
+        let t = setup();
+        let ru = "http://localhost:3000";
+        let (st, v) = register_cb(&t, json!([ru])).await;
+        assert_eq!(st, StatusCode::CREATED, "{v}");
+        let cid = s(&v, "client_id");
+        let chal = challenge(VERIFIER);
+        let state = "a b&c=d\u{7}\u{1F600}%41";
+        let q = authorize_query(&cid, ru, &chal, &[("resource", RES)]).replace(
+            "state=xyz",
+            &format!(
+                "state={}",
+                url::form_urlencoded::byte_serialize(state.as_bytes()).collect::<String>()
+            ),
+        );
+        let (tok, _, body) = consent(&t, &q).await;
+        // hidden value is the exact string; state kept (control char as a character reference)
+        assert!(
+            body.contains(&format!("name=\"redirect_uri\" value=\"{ru}\"")),
+            "{body}"
+        );
+        assert!(body.contains("&#7;"), "{body}");
+        let post = req("POST", "/authorize")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("cookie", format!("warden_csrf={tok}"))
+            .body(Body::from(form(&[
+                ("client_id", &cid),
+                ("redirect_uri", ru),
+                ("response_type", "code"),
+                ("code_challenge", &chal),
+                ("code_challenge_method", "S256"),
+                ("state", state),
+                ("resource", RES),
+                ("csrf", &tok),
+                ("passphrase", PASS),
+            ])))
+            .unwrap();
+        let (st, h, _) = send(&t, post, "203.0.113.2").await;
+        assert_eq!(st, StatusCode::FOUND);
+        let loc = Url::parse(h[header::LOCATION].to_str().unwrap()).unwrap();
+        let q: HashMap<_, _> = loc.query_pairs().into_owned().collect();
+        assert_eq!(q["state"], state, "state is echoed exactly");
+        let (st, _, v) = token_req(
+            &t,
+            &[
+                ("grant_type", "authorization_code"),
+                ("code", &q["code"]),
+                ("client_id", &cid),
+                ("redirect_uri", ru),
+                ("code_verifier", VERIFIER),
+            ],
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+    }
+
+    #[test]
+    fn new_hashes_use_stronger_params_and_old_ones_verify() {
+        let new = hasher()
+            .hash_password(b"pw-pw-pw-pw-pw")
+            .unwrap()
+            .to_string();
+        assert!(new.contains("m=65536,t=3,p=1"), "{new}");
+        assert!(verify_passphrase(&new, "pw-pw-pw-pw-pw"));
+        let old = Argon2::default()
+            .hash_password(b"old-old-old-old")
+            .unwrap()
+            .to_string();
+        assert!(old.contains("m=19456"), "{old}");
+        assert!(verify_passphrase(&old, "old-old-old-old"));
     }
 
     #[test]

@@ -4,6 +4,8 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    - cron: "17 5 * * *"   # daily: new advisories can land without a code change
 
 permissions:
   contents: read
@@ -27,3 +29,13 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@2d81d658c8c4093152107cdb91c1e9545a9f992c # 1.94
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - run: cargo install cargo-audit --locked
+      # Vulnerabilities fail the job; "unmaintained" notices (chrono) are warnings.
+      - run: cargo audit

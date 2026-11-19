@@ -86,7 +86,10 @@ fn apply(
     current: &EpssCursor,
 ) -> DbResult<Applied> {
     let plain: Box<dyn std::io::Read + '_> = if gz_bytes.starts_with(&[0x1f, 0x8b]) {
-        Box::new(flate2::read::GzDecoder::new(gz_bytes))
+        Box::new(super::CapReader::new(
+            flate2::read::GzDecoder::new(gz_bytes),
+            super::MAX_DECOMPRESSED_BYTES,
+        ))
     } else {
         Box::new(gz_bytes)
     };
@@ -168,7 +171,7 @@ impl EpssSource {
             .get(reqwest::header::ETAG)
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned);
-        let body = resp.bytes().await.context("reading EPSS body")?;
+        let body = super::read_body_capped(resp, &self.url, super::MAX_EPSS_GZ_BYTES).await?;
         if body.is_empty() {
             bail!("EPSS download was empty");
         }

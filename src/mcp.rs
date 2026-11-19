@@ -38,7 +38,7 @@ use crate::{
         },
         feed::{self, FeedOptions},
         sync::Syncer,
-        tracked,
+        tracked::{self, UserError},
     },
 };
 
@@ -51,6 +51,8 @@ pub const SYNC_COOLDOWN: Duration = Duration::from_secs(5 * 60);
 /// NVD lookups for a single CVE id.
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_ACK_IDS: usize = 500;
+/// Discovery results kept in memory (oldest evicted first).
+const MAX_DISCOVERY_CACHE: usize = 32;
 
 const INSTRUCTIONS: &str = "\
 warden is a CVE feed for the software the user runs. Typical loop: call get_new_cves, summarize \
@@ -317,23 +319,54 @@ fn user_err(msg: impl Into<String>) -> Result<CallToolResult, McpError> {
     Ok(CallToolResult::error(vec![ContentBlock::text(msg.into())]))
 }
 
+/// Short random reference shown to the caller and written to the log with the full error.
+fn error_id() -> String {
+    let mut b = [0u8; 4];
+    if getrandom::fill(&mut b).is_err() {
+        b = std::process::id().to_le_bytes();
+    }
+    crate::auth::hex(&b)
+}
+
+/// An internal failure: the caller gets a generic message plus a reference id, the log
+/// gets the full cause chain under the same id. Input mistakes ([`UserError`]) keep their
+/// specific message.
 fn internal_err(what: &str, e: &anyhow::Error) -> Result<CallToolResult, McpError> {
-    tracing::error!("{what}: {e:#}");
-    user_err(format!("{what} failed: {e:#}"))
+    if let Some(u) = e.downcast_ref::<UserError>() {
+        return user_err(u.0.clone());
+    }
+    let id = error_id();
+    tracing::error!(error_id = %id, "{what}: {e:#}");
+    user_err(format!(
+        "{what} failed because of an internal error (ref {id}); the details are in the server log. Try again shortly."
+    ))
 }
 
 fn principal_name(parts: &axum::http::request::Parts) -> Option<String> {
     parts.extensions.get::<Principal>().map(|p| p.name.clone())
 }
 
+/// `^[a-zA-Z0-9._:-]{1,64}$`: what a consumer (ack cursor) name may look like.
+fn valid_consumer(c: &str) -> bool {
+    (1..=64).contains(&c.len())
+        && c.chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | ':' | '-'))
+}
+
+/// The consumer (ack cursor) for a call: the explicit name, else the authenticated
+/// principal (`<api key name>` or `oauth:<label>`), else `default`.
+///
+/// An explicit name is accepted as given, so any authenticated caller can read or move
+/// another consumer's cursor. That is deliberate for a single-user server (all callers are
+/// the owner); it is not a security boundary.
 fn resolve_consumer(explicit: Option<String>, principal: Option<String>) -> Result<String, String> {
     let c = explicit
         .map(|c| c.trim().to_owned())
         .filter(|c| !c.is_empty())
         .or(principal)
         .unwrap_or_else(|| "default".to_owned());
-    if c.len() > 64 || c.chars().any(char::is_control) {
-        return Err("consumer must be at most 64 characters with no control characters".into());
+    if !valid_consumer(&c) {
+        return Err("consumer must be 1-64 characters from letters, digits and . _ : -".into());
     }
     Ok(c)
 }
@@ -374,18 +407,36 @@ impl Warden {
         let r = tokio::time::timeout(DISCOVERY_TIMEOUT, run)
             .await
             .map_err(|_| {
-                anyhow::anyhow!(
+                anyhow::Error::new(UserError(format!(
                     "discovery timed out after {}s (NVD is slow or rate limiting); try again shortly",
                     DISCOVERY_TIMEOUT.as_secs()
-                )
+                )))
             })??;
         let r = Arc::new(r);
-        self.deps
-            .discoveries
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(key, (Instant::now(), r.clone()));
+        {
+            let mut c = self
+                .deps
+                .discoveries
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            cache_insert(&mut c, key, r.clone());
+        }
         Ok(r)
+    }
+}
+
+/// Insert into the discovery cache, evicting the oldest entries beyond [`MAX_DISCOVERY_CACHE`].
+fn cache_insert(c: &mut DiscoveryCache, key: String, r: Arc<DiscoveryResult>) {
+    c.insert(key, (Instant::now(), r));
+    while c.len() > MAX_DISCOVERY_CACHE {
+        let Some(oldest) = c
+            .iter()
+            .min_by_key(|(_, (t, _))| *t)
+            .map(|(k, _)| k.clone())
+        else {
+            break;
+        };
+        c.remove(&oldest);
     }
 }
 
@@ -406,8 +457,8 @@ struct IndexedCandidate<'a> {
 #[tool_router]
 impl Warden {
     #[tool(
-        description = "List CVEs that are new or changed for this consumer and not yet acknowledged, ranked KEV first then by CVSS. Returns {items, more, stale, health}. Each item has cve, product, cvss, severity, kev, epss, change (new|backfill|kev_added|cvss_changed|rejected), summary, fixed_versions. Does not consume anything: call ack afterwards.",
-        annotations(read_only_hint = true)
+        description = "List CVEs that are new or changed for this consumer and not yet acknowledged, ranked KEV first then by CVSS. Returns {items, more, stale, health}. Each item has cve, product, cvss, severity, kev, epss, change (new|backfill|kev_added|cvss_changed|rejected), summary, fixed_versions. Does not consume anything (it only remembers what it showed, so the ack covers exactly that): call ack afterwards.",
+        annotations(read_only_hint = false, idempotent_hint = true)
     )]
     async fn get_new_cves(
         &self,
@@ -505,8 +556,8 @@ impl Warden {
         &self,
         Parameters(p): Parameters<DiscoverParams>,
     ) -> Result<CallToolResult, McpError> {
-        if p.name.trim().is_empty() {
-            return user_err("name is empty");
+        if let Err(m) = check_name(&p.name) {
+            return user_err(m);
         }
         match self.discover_cached(&p.name).await {
             Ok(r) => ok_json(&DiscoveryOut {
@@ -519,7 +570,7 @@ impl Warden {
                     .collect(),
                 warnings: &r.warnings,
             }),
-            Err(e) => user_err(format!("discovery failed: {e:#}")),
+            Err(e) => internal_err("discovery", &e),
         }
     }
 
@@ -532,14 +583,17 @@ impl Warden {
         Parameters(p): Parameters<AddTrackedParams>,
     ) -> Result<CallToolResult, McpError> {
         let name = p.name.trim().to_owned();
-        if name.is_empty() {
-            return user_err("name is empty");
+        if let Err(m) = check_name(&name) {
+            return user_err(m);
         }
         let who = principal_name(&parts).unwrap_or_else(|| "agent".into());
         let ov = p.overrides.unwrap_or_default();
         let manual_input = ov.cpes.as_ref().is_some_and(|c| !c.is_empty())
             || ov.keywords.as_ref().is_some_and(|k| !k.is_empty());
         let overrides = ov.into_overrides(&who);
+        if let Err(e) = tracked::validate_overrides(&overrides) {
+            return user_err(e.0);
+        }
         let (candidate, note) = match self.discover_cached(&name).await {
             Ok(r) => match r.candidates.get(p.candidate_index.unwrap_or(0)) {
                 Some(c) => (c.clone(), None),
@@ -551,15 +605,24 @@ impl Warden {
                     ));
                 }
             },
-            Err(e) if manual_input => (
-                blank_candidate(&name, overrides.cpes.is_some()),
-                Some(format!("discovery failed ({e:#}); saved manually")),
-            ),
+            Err(e) if manual_input => {
+                let id = error_id();
+                tracing::warn!(error_id = %id, "add_tracked: discovery failed, saving manually: {e:#}");
+                (
+                    blank_candidate(&name, overrides.cpes.is_some()),
+                    Some(format!("discovery failed (ref {id}); saved manually")),
+                )
+            }
             Err(e) => {
-                return user_err(format!(
-                    "discovery failed: {e:#}. Retry later, or pass overrides.cpes / \
-                     overrides.keywords to add the product manually."
-                ));
+                if e.downcast_ref::<UserError>().is_some() {
+                    return user_err(format!(
+                        "{e}. Retry later, or pass overrides.cpes / overrides.keywords to add the product manually."
+                    ));
+                }
+                return internal_err(
+                    "discovery (retry later, or pass overrides.cpes / overrides.keywords to add the product manually)",
+                    &e,
+                );
             }
         };
         let res = tracked::add_candidate(
@@ -578,7 +641,7 @@ impl Warden {
                 }
                 ok_json(&v)
             }
-            Err(e) => user_err(format!("could not save product: {e:#}")),
+            Err(e) => internal_err("saving the product", &e),
         }
     }
 
@@ -591,11 +654,15 @@ impl Warden {
         Parameters(p): Parameters<UpdateTrackedParams>,
     ) -> Result<CallToolResult, McpError> {
         let who = principal_name(&parts).unwrap_or_else(|| "agent".into());
+        let overrides = p.fields.into_overrides(&who);
+        if let Err(e) = tracked::validate_overrides(&overrides) {
+            return user_err(e.0);
+        }
         let res = tracked::update(
             &self.deps.syncer.ctx,
             Some(&self.deps.syncer.nvd_api.api),
             &p.id,
-            p.fields.into_overrides(&who),
+            overrides,
             self.deps.config.backfill_days,
         )
         .await;
@@ -605,7 +672,7 @@ impl Warden {
                 "no tracked product with id `{}`; call list_tracked for the ids",
                 p.id
             )),
-            Err(e) => user_err(format!("could not update product: {e:#}")),
+            Err(e) => internal_err("updating the product", &e),
         }
     }
 
@@ -692,6 +759,19 @@ impl Warden {
     }
 }
 
+fn check_name(name: &str) -> Result<(), String> {
+    if name.trim().is_empty() {
+        return Err("name is empty".into());
+    }
+    if name.chars().count() > tracked::MAX_NAME_CHARS {
+        return Err(format!(
+            "name is too long (max {} characters)",
+            tracked::MAX_NAME_CHARS
+        ));
+    }
+    Ok(())
+}
+
 fn blank_candidate(name: &str, has_cpes: bool) -> Candidate {
     use crate::monitors::cve::normalize::slugify;
     Candidate {
@@ -752,6 +832,49 @@ mod tests {
             "default"
         );
         assert!(resolve_consumer(Some("a".repeat(65)), None).is_err());
+        // charset: letters, digits and . _ : -
+        for ok in ["claude-ai", "oauth:routine.1", "k_2", "A"] {
+            assert_eq!(resolve_consumer(Some(ok.into()), None).unwrap(), ok);
+        }
+        for bad in ["a b", "x\u{7}", "a/b", "caf\u{e9}", "<x>", "a;b", "a\nb"] {
+            assert!(resolve_consumer(Some(bad.into()), None).is_err(), "{bad:?}");
+        }
+        // a derived principal is checked too
+        assert!(resolve_consumer(None, Some("bad name".into())).is_err());
+    }
+
+    #[test]
+    fn internal_errors_are_generic_but_user_errors_are_specific() {
+        let text = |r: Result<CallToolResult, McpError>| {
+            serde_json::to_string(&r.unwrap().content).unwrap()
+        };
+        let secret = anyhow::anyhow!("open /srv/warden/data/warden.db: disk I/O error")
+            .context("sql: SELECT secret FROM t");
+        let out = text(internal_err("reading the feed", &secret));
+        assert!(
+            out.contains("ref ") && out.contains("internal error"),
+            "{out}"
+        );
+        assert!(!out.contains("/srv") && !out.contains("SELECT"), "{out}");
+        let u = anyhow::Error::new(UserError("candidate 3 is out of range".into()));
+        assert!(text(internal_err("x", &u)).contains("candidate 3 is out of range"));
+    }
+
+    #[test]
+    fn discovery_cache_is_bounded_oldest_first() {
+        let mut c = DiscoveryCache::new();
+        let r = || {
+            Arc::new(DiscoveryResult {
+                query: String::new(),
+                candidates: vec![],
+                warnings: vec![],
+            })
+        };
+        for i in 0..(MAX_DISCOVERY_CACHE + 10) {
+            cache_insert(&mut c, format!("k{i}"), r());
+        }
+        assert_eq!(c.len(), MAX_DISCOVERY_CACHE);
+        assert!(!c.contains_key("k0") && c.contains_key(&format!("k{}", MAX_DISCOVERY_CACHE + 9)));
     }
 
     #[test]

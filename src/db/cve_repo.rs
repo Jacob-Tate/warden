@@ -76,6 +76,10 @@ pub enum UpsertResult {
     Updated,
     /// Stored data is already as new as the incoming record.
     Skipped,
+    /// The record's version timestamp is not a valid timestamp; nothing was written (a raw
+    /// string stored as `cvelist_updated`/`nvd_updated` could outrank every later update
+    /// and freeze the record).
+    Rejected,
 }
 
 /// Normalize an upstream timestamp (`...Z`, no zone, offset, with/without
@@ -94,6 +98,11 @@ pub fn normalize_ts(s: &str) -> String {
         }
     }
     s.to_owned()
+}
+
+/// True if `s` is already in the canonical `normalize_ts` form (so it orders chronologically).
+pub fn is_canonical_ts(s: &str) -> bool {
+    DateTime::parse_from_rfc3339(s).is_ok() && normalize_ts(s) == s
 }
 
 // ---- cursors ---------------------------------------------------------------
@@ -238,6 +247,9 @@ fn replace_affected(
 /// Insert or update from a cvelist record. Skips when the stored
 /// `cvelist_updated` is not older than the record's `dateUpdated`.
 pub fn upsert_cvelist(conn: &Connection, r: &CvelistUpsert) -> DbResult<UpsertResult> {
+    if !is_canonical_ts(&r.date_updated) {
+        return Ok(UpsertResult::Rejected);
+    }
     let existing: Option<(Option<String>, String, String)> = conn
         .query_row(
             "SELECT cvelist_updated, cvss_all, fixed_nvd FROM cves WHERE cve_id = ?1",
@@ -348,6 +360,9 @@ pub fn upsert_cvelist(conn: &Connection, r: &CvelistUpsert) -> DbResult<UpsertRe
 /// `nvd_*`, the nvd affected rows, `fixed_nvd` and the derived columns (the
 /// description/published are filled only when empty).
 pub fn upsert_nvd(conn: &Connection, r: &NvdUpsert) -> DbResult<UpsertResult> {
+    if !is_canonical_ts(&r.last_modified) {
+        return Ok(UpsertResult::Rejected);
+    }
     let existing: Option<(Option<String>, String, String)> = conn
         .query_row(
             "SELECT nvd_updated, cvss_all, fixed_cna FROM cves WHERE cve_id = ?1",
@@ -517,5 +532,9 @@ mod tests {
             "2026-11-19T21:00:08.000Z"
         );
         assert_eq!(normalize_ts("garbage"), "garbage");
+        assert!(is_canonical_ts("2026-11-19T20:59:01.120Z"));
+        assert!(!is_canonical_ts("garbage"));
+        assert!(!is_canonical_ts("zzzz"));
+        assert!(!is_canonical_ts("2026-11-19T20:59:01Z"));
     }
 }

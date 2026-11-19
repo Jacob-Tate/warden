@@ -288,9 +288,14 @@ async fn apply_records(ctx: &SourceContext, pages: Vec<Vec<NvdUpsert>>) -> Resul
         .call(move |c| {
             let tx = c.transaction()?;
             let mut out = SyncOutcome::default();
+            let mut bad_timestamps = 0usize;
             for rec in pages.iter().flatten() {
                 match upsert_nvd(&tx, rec)? {
                     UpsertResult::Skipped => out.skipped += 1,
+                    UpsertResult::Rejected => {
+                        out.skipped += 1;
+                        bad_timestamps += 1;
+                    }
                     r => {
                         out.changed += 1;
                         out.changed_ids.push(rec.cve_id.clone());
@@ -301,6 +306,12 @@ async fn apply_records(ctx: &SourceContext, pages: Vec<Vec<NvdUpsert>>) -> Resul
                 }
             }
             tx.commit()?;
+            if bad_timestamps > 0 {
+                tracing::warn!(
+                    records = bad_timestamps,
+                    "nvd_api: records skipped because lastModified is not a valid timestamp"
+                );
+            }
             Ok(out)
         })
         .await?)

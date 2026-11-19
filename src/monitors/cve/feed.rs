@@ -2,9 +2,12 @@
 //!
 //! # Semantics
 //!
-//! A *delivered* row (written only by [`ack`]) records what a consumer has seen
-//! for a `(cve, product)` pair together with a snapshot of the chosen CVSS, the
-//! KEV flag and the CVE state. [`get_new`] never writes anything.
+//! A *delivered* row records what a consumer has seen for a `(cve, product)` pair together
+//! with a snapshot of the chosen CVSS, the KEV flag and the CVE state. [`get_new`] only
+//! records a *pending* snapshot (`pending_*` columns: what it just showed) and never
+//! hides anything; [`ack`] promotes the pending snapshot to the acked one (falling back to
+//! the current state when nothing was delivered), so a change that lands between the get
+//! and the ack is surfaced again instead of being swallowed.
 //!
 //! For each matched `(cve, product)` and consumer:
 //!
@@ -170,9 +173,27 @@ struct Row {
     snap_cvss: Option<f64>,
     snap_kev: bool,
     snap_state: Option<String>,
+    /// The state `get_new` last showed this consumer (not yet acked), if any.
+    pending: Option<Snapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct Snapshot {
+    cvss: Option<f64>,
+    kev: bool,
+    state: String,
 }
 
 impl Row {
+    /// The state as it is right now.
+    fn current(&self) -> Snapshot {
+        Snapshot {
+            cvss: self.cvss.map(|c| c.0),
+            kev: self.kev,
+            state: self.state.clone(),
+        }
+    }
+
     fn rejected(&self) -> bool {
         self.state.eq_ignore_ascii_case("REJECTED")
     }
@@ -192,14 +213,19 @@ fn load_rows(conn: &Connection, consumer: &str) -> DbResult<Vec<Row>> {
                 c.nvd_cvss_score, c.nvd_cvss_primary, k.cve_id IS NOT NULL, k.date_added, e.score, \
                 EXISTS (SELECT 1 FROM cve_product_matches m \
                         WHERE m.cve_id = pr.cve_id AND m.product_id = pr.product_id), \
-                d.cve_id IS NOT NULL, d.snapshot_cvss, COALESCE(d.snapshot_kev, 0), d.snapshot_state \
+                d.acked_at IS NOT NULL, \
+                CASE WHEN d.acked_at IS NOT NULL THEN d.snapshot_cvss END, \
+                CASE WHEN d.acked_at IS NOT NULL THEN d.snapshot_kev ELSE 0 END, \
+                CASE WHEN d.acked_at IS NOT NULL THEN d.snapshot_state END, \
+                d.pending_at IS NOT NULL, d.pending_cvss, COALESCE(d.pending_kev, 0), \
+                COALESCE(d.pending_state, '') \
          FROM pairs pr \
          JOIN cves c ON c.cve_id = pr.cve_id \
          JOIN tracked_products p ON p.id = pr.product_id \
          LEFT JOIN kev k ON k.cve_id = c.cve_id \
          LEFT JOIN epss e ON e.cve_id = c.cve_id \
          LEFT JOIN delivered d ON d.consumer = ?1 AND d.cve_id = pr.cve_id \
-              AND d.product_id = pr.product_id AND d.acked_at IS NOT NULL",
+              AND d.product_id = pr.product_id",
     )?;
     let rows = st.query_map([consumer], |r| {
         let fixed: String = r.get(8)?;
@@ -222,6 +248,15 @@ fn load_rows(conn: &Connection, consumer: &str) -> DbResult<Vec<Row>> {
             snap_cvss: r.get(18)?,
             snap_kev: r.get(19)?,
             snap_state: r.get(20)?,
+            pending: if r.get::<_, bool>(21)? {
+                Some(Snapshot {
+                    cvss: r.get(22)?,
+                    kev: r.get(23)?,
+                    state: r.get(24)?,
+                })
+            } else {
+                None
+            },
         })
     })?;
     Ok(rows.collect::<Result<_, _>>()?)
@@ -327,14 +362,50 @@ pub fn source_health(
     Ok(out)
 }
 
-/// Compute the feed for `consumer`. Read-only.
+/// Store, per returned `(cve, product)`, the state that was shown (the pending snapshot).
+/// Never touches `acked_at` or the acked snapshot, so nothing is hidden by a fetch.
+fn record_delivered<'a>(
+    conn: &mut Connection,
+    consumer: &str,
+    rows: impl Iterator<Item = &'a Row>,
+) -> DbResult<()> {
+    let tx = conn.transaction()?;
+    let now = now_rfc3339();
+    {
+        let mut st = tx.prepare_cached(
+            "INSERT INTO delivered (consumer, cve_id, product_id, delivered_at, pending_at, \
+                 pending_cvss, pending_kev, pending_state) \
+             VALUES (?1, ?2, ?3, ?4, ?4, ?5, ?6, ?7) \
+             ON CONFLICT(consumer, cve_id, product_id) DO UPDATE SET pending_at = excluded.pending_at, \
+                 pending_cvss = excluded.pending_cvss, pending_kev = excluded.pending_kev, \
+                 pending_state = excluded.pending_state",
+        )?;
+        for r in rows {
+            let s = r.current();
+            st.execute(params![
+                consumer,
+                r.cve_id,
+                r.product_id,
+                now,
+                s.cvss,
+                s.kev,
+                s.state
+            ])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Compute the feed for `consumer`. Only bookkeeping is written (see [`record_delivered`]);
+/// nothing is consumed.
 pub async fn get_new(db: &Db, consumer: &str, opts: &FeedOptions) -> Result<FeedEnvelope> {
     let (consumer, opts) = (consumer.to_owned(), opts.clone());
     Ok(db
         .call(move |conn| {
             let wanted = opts.product.as_deref().map(str::to_lowercase);
-            let mut items: Vec<FeedItem> = load_rows(conn, &consumer)?
-                .iter()
+            let mut items: Vec<(FeedItem, Row)> = load_rows(conn, &consumer)?
+                .into_iter()
                 .filter(|r| {
                     wanted.as_ref().is_none_or(|w| {
                         r.product_id.to_lowercase() == *w || r.product_name.to_lowercase() == *w
@@ -345,13 +416,20 @@ pub async fn get_new(db: &Db, consumer: &str, opts: &FeedOptions) -> Result<Feed
                         .is_none_or(|m| r.cvss.is_some_and(|c| c.0 >= m))
                 })
                 .filter_map(|r| {
-                    classify(r, opts.backfill_days, opts.include_acked).map(|c| to_item(r, c))
+                    classify(&r, opts.backfill_days, opts.include_acked)
+                        .map(|c| (to_item(&r, c), r))
                 })
                 .collect();
-            items.sort_by(rank);
+            items.sort_by(|a, b| rank(&a.0, &b.0));
             let limit = opts.limit.clamp(1, MAX_LIMIT);
             let more = items.len().saturating_sub(limit);
             items.truncate(limit);
+            // Remember exactly what is being handed over; best effort (without it `ack`
+            // falls back to the state at ack time).
+            if let Err(e) = record_delivered(conn, &consumer, items.iter().map(|(_, r)| r)) {
+                tracing::warn!(error = %e, "recording delivered snapshots failed");
+            }
+            let items: Vec<FeedItem> = items.into_iter().map(|(i, _)| i).collect();
             let health = source_health(conn, Utc::now())?;
             let stale = CORE_SOURCES
                 .iter()
@@ -377,21 +455,24 @@ fn ack_rows(conn: &mut Connection, consumer: &str, pick: impl Fn(&Row) -> bool) 
     let tx = conn.transaction()?;
     let now = now_rfc3339();
     for r in &rows {
+        // What the consumer was actually shown, else (never delivered) the state right now.
+        let snap = r.pending.clone().unwrap_or_else(|| r.current());
         tx.execute(
             "INSERT INTO delivered (consumer, cve_id, product_id, delivered_at, acked_at, \
                  snapshot_cvss, snapshot_kev, snapshot_state) \
              VALUES (?1, ?2, ?3, ?4, ?4, ?5, ?6, ?7) \
              ON CONFLICT(consumer, cve_id, product_id) DO UPDATE SET acked_at = excluded.acked_at, \
                  snapshot_cvss = excluded.snapshot_cvss, snapshot_kev = excluded.snapshot_kev, \
-                 snapshot_state = excluded.snapshot_state",
+                 snapshot_state = excluded.snapshot_state, \
+                 pending_at = NULL, pending_cvss = NULL, pending_kev = NULL, pending_state = NULL",
             params![
                 consumer,
                 r.cve_id,
                 r.product_id,
                 now,
-                r.cvss.map(|c| c.0),
-                r.kev,
-                r.state
+                snap.cvss,
+                snap.kev,
+                snap.state
             ],
         )?;
     }
@@ -399,8 +480,9 @@ fn ack_rows(conn: &mut Connection, consumer: &str, pick: impl Fn(&Row) -> bool) 
     Ok(rows.len())
 }
 
-/// Acknowledge CVE ids for every product they match: records the current chosen
-/// CVSS, KEV flag and state as the consumer's snapshot. Returns the number of
+/// Acknowledge CVE ids for every product they match: promotes the snapshot `get_new`
+/// recorded (what the consumer was shown) to the acked snapshot, or records the current
+/// chosen CVSS, KEV flag and state when nothing was delivered. Returns the number of
 /// `(cve, product)` rows written. Unknown ids are ignored.
 pub async fn ack(db: &Db, consumer: &str, cve_ids: &[String]) -> Result<usize> {
     let consumer = consumer.to_owned();
@@ -816,6 +898,139 @@ mod tests {
         .await
         .unwrap();
         assert!(env.items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn change_between_get_and_ack_is_resurfaced() {
+        let db = setup();
+        db.with_conn(|c| {
+            cve(
+                c,
+                "CVE-2026-3001",
+                "2026-11-12T00:00:00.000Z",
+                Some(5.0),
+                None,
+                "a",
+            );
+            cve(
+                c,
+                "CVE-2026-3002",
+                "2026-11-12T00:00:00.000Z",
+                Some(7.5),
+                None,
+                "b",
+            );
+            Ok(())
+        })
+        .unwrap();
+        let env = get_new(&db, "me", &opts()).await.unwrap();
+        assert_eq!(env.items.len(), 2);
+        // fetching again (pending but unacked) still lists everything: nothing consumed
+        assert_eq!(get_new(&db, "me", &opts()).await.unwrap().items.len(), 2);
+        // while the agent is summarizing: 3001 enters KEV, 3002's score jumps a band
+        db.with_conn(|c| {
+            c.execute("INSERT INTO kev (cve_id, date_added, first_seen_at) VALUES ('CVE-2026-3001', '2026-11-18', 'x')", [])?;
+            c.execute("UPDATE cves SET cna_cvss_score = 9.8 WHERE cve_id = 'CVE-2026-3002'", [])?;
+            Ok(())
+        })
+        .unwrap();
+        // ack what was delivered (ids from the first get)
+        let ids: Vec<String> = env.items.iter().map(|i| i.cve.clone()).collect();
+        // (a consumer that re-fetched after the change would have been shown the new state;
+        // here the ack is for the state it actually saw)
+        let n = ack(&db, "me", &ids).await.unwrap();
+        assert_eq!(n, 2);
+        let after = get_new(&db, "me", &opts()).await.unwrap();
+        let got: Vec<(&str, Change)> = after
+            .items
+            .iter()
+            .map(|i| (i.cve.as_str(), i.change))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("CVE-2026-3001", Change::KevAdded),
+                ("CVE-2026-3002", Change::CvssChanged)
+            ],
+            "changes after delivery must come back after the ack"
+        );
+        // acking the re-surfaced state settles it; nothing left
+        let ids: Vec<String> = after.items.iter().map(|i| i.cve.clone()).collect();
+        ack(&db, "me", &ids).await.unwrap();
+        assert!(get_new(&db, "me", &opts()).await.unwrap().items.is_empty());
+        // ack without any prior get falls back to the current state
+        db.with_conn(|c| {
+            cve(
+                c,
+                "CVE-2026-3003",
+                "2026-11-12T00:00:00.000Z",
+                Some(5.0),
+                None,
+                "c",
+            );
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            ack(&db, "fresh", &["CVE-2026-3003".into()]).await.unwrap(),
+            1
+        );
+        db.with_conn(|c| {
+            c.execute(
+                "UPDATE cves SET cna_cvss_score = 9.9 WHERE cve_id = 'CVE-2026-3003'",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        // that consumer snapshotted 5.0 at ack time, so the jump shows
+        let env = get_new(&db, "fresh", &opts()).await.unwrap();
+        assert!(
+            env.items
+                .iter()
+                .any(|i| i.cve == "CVE-2026-3003" && i.change == Change::CvssChanged)
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_snapshot_tracks_the_latest_delivery_and_is_cleared_by_ack() {
+        let db = setup();
+        db.with_conn(|c| {
+            cve(
+                c,
+                "CVE-2026-3101",
+                "2026-11-12T00:00:00.000Z",
+                Some(5.0),
+                None,
+                "a",
+            );
+            Ok(())
+        })
+        .unwrap();
+        get_new(&db, "me", &opts()).await.unwrap();
+        db.with_conn(|c| {
+            c.execute(
+                "UPDATE cves SET cna_cvss_score = 9.0 WHERE cve_id = 'CVE-2026-3101'",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        // a second get shows (and records) the new score, so acking it is final
+        let env = get_new(&db, "me", &opts()).await.unwrap();
+        assert_eq!(env.items[0].cvss, Some(9.0));
+        ack(&db, "me", &["CVE-2026-3101".into()]).await.unwrap();
+        assert!(get_new(&db, "me", &opts()).await.unwrap().items.is_empty());
+        let pending: i64 = db
+            .with_conn(|c| {
+                Ok(c.query_row(
+                    "SELECT COUNT(*) FROM delivered WHERE pending_at IS NOT NULL",
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(pending, 0);
     }
 
     #[tokio::test]

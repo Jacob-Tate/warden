@@ -11,7 +11,6 @@
 //! challenge. A small in-memory per-IP limiter answers `429` after too many failures.
 
 use std::{
-    collections::HashMap,
     future::Future,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     pin::Pin,
@@ -31,6 +30,8 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
+use crate::ratelimit::{Expiry, Table};
+
 /// The authenticated caller. `name` is the API key's name (or, later, the OAuth client).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Principal {
@@ -42,6 +43,19 @@ pub type ValidateFuture<'a> = Pin<Box<dyn Future<Output = Option<Principal>> + S
 /// A way of turning a bearer token into a [`Principal`].
 pub trait TokenValidator: Send + Sync {
     fn validate<'a>(&'a self, token: &'a str) -> ValidateFuture<'a>;
+
+    /// True if validating costs a database lookup; such validators are skipped for tokens
+    /// that fail the cheap [`token_shaped`] check.
+    fn needs_db(&self) -> bool {
+        false
+    }
+}
+
+/// Cheap format check for issued tokens: 32 random bytes as unpadded base64url.
+pub fn token_shaped(t: &str) -> bool {
+    t.len() == 43
+        && t.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 /// Static API keys: `name:sha256hex` entries; only hashes are held in memory.
@@ -147,40 +161,48 @@ pub fn hash_key_command(name: Option<&str>) -> Result<String> {
 pub const MAX_FAILURES: usize = 10;
 pub const FAILURE_WINDOW: Duration = Duration::from_secs(300);
 
-/// In-memory per-IP failure counter.
-#[derive(Default)]
+/// In-memory per-address failure counter (fixed window; addresses keyed per
+/// [`crate::ratelimit::key`], bounded to [`MAX_TRACKED`] entries).
 pub struct FailureLimiter {
-    failures: Mutex<HashMap<IpAddr, Vec<Instant>>>,
+    max: u32,
+    window: Duration,
+    table: Mutex<Table>,
+}
+
+/// Addresses tracked at once by each limiter table.
+pub const MAX_TRACKED: usize = 10_000;
+
+impl Default for FailureLimiter {
+    fn default() -> Self {
+        Self::new(MAX_FAILURES as u32, FAILURE_WINDOW)
+    }
 }
 
 impl FailureLimiter {
-    pub fn blocked(&self, ip: IpAddr) -> bool {
-        let mut m = self.failures.lock().unwrap_or_else(|e| e.into_inner());
-        let now = Instant::now();
-        match m.get_mut(&ip) {
-            Some(v) => {
-                v.retain(|t| now.duration_since(*t) < FAILURE_WINDOW);
-                if v.is_empty() {
-                    m.remove(&ip);
-                    false
-                } else {
-                    v.len() >= MAX_FAILURES
-                }
-            }
-            None => false,
+    pub fn new(max: u32, window: Duration) -> Self {
+        Self {
+            max,
+            window,
+            table: Mutex::new(Table::new(window, Expiry::Fixed, MAX_TRACKED)),
         }
     }
 
+    fn lock(&self) -> std::sync::MutexGuard<'_, Table> {
+        self.table.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn window(&self) -> Duration {
+        self.window
+    }
+
+    pub fn blocked(&self, ip: IpAddr) -> bool {
+        self.lock()
+            .get(ip, Instant::now())
+            .is_some_and(|c| c.count >= self.max)
+    }
+
     pub fn record_failure(&self, ip: IpAddr) {
-        let mut m = self.failures.lock().unwrap_or_else(|e| e.into_inner());
-        let now = Instant::now();
-        if m.len() > 10_000 {
-            m.retain(|_, v| {
-                v.last()
-                    .is_some_and(|t| now.duration_since(*t) < FAILURE_WINDOW)
-            });
-        }
-        m.entry(ip).or_default().push(now);
+        self.lock().hit(ip, Instant::now());
     }
 }
 
@@ -251,7 +273,14 @@ pub async fn require_auth(State(st): State<AuthState>, mut req: Request, next: N
     let token = bearer(&req).map(str::to_owned);
     let mut principal = None;
     if let Some(token) = &token {
+        // Order: format check -> in-memory validators -> (shaped tokens only) database
+        // validators. A well-formed valid token is served even from a blocked address
+        // (see above); malformed tokens never reach SQLite.
+        let shaped = token_shaped(token);
         for v in st.validators.iter() {
+            if v.needs_db() && !shaped {
+                continue;
+            }
             if let Some(p) = v.validate(token).await {
                 principal = Some(p);
                 break;
@@ -269,7 +298,7 @@ pub async fn require_auth(State(st): State<AuthState>, mut req: Request, next: N
                 *r.status_mut() = StatusCode::TOO_MANY_REQUESTS;
                 r.headers_mut().insert(
                     header::RETRY_AFTER,
-                    HeaderValue::from(FAILURE_WINDOW.as_secs()),
+                    HeaderValue::from(st.limiter.window().as_secs()),
                 );
                 return r;
             }
@@ -437,6 +466,28 @@ mod tests {
         l.record_failure(ip);
         assert!(l.blocked(ip));
         assert!(!l.blocked("10.0.0.2".parse().unwrap()));
+    }
+
+    #[test]
+    fn limiter_keys_ipv6_by_64_and_maps_v4() {
+        let l = FailureLimiter::default();
+        for i in 0..MAX_FAILURES {
+            l.record_failure(format!("2001:db8:5:6::{:x}", i + 1).parse().unwrap());
+        }
+        assert!(l.blocked("2001:db8:5:6:dead:beef::1".parse().unwrap()));
+        assert!(!l.blocked("2001:db8:5:7::1".parse().unwrap()));
+        for _ in 0..MAX_FAILURES {
+            l.record_failure("::ffff:198.51.100.7".parse().unwrap());
+        }
+        assert!(l.blocked("198.51.100.7".parse().unwrap()));
+    }
+
+    #[test]
+    fn token_shape() {
+        assert!(token_shaped(&generate_key().unwrap()));
+        assert!(!token_shaped("short"));
+        assert!(!token_shaped(&"a".repeat(42)));
+        assert!(!token_shaped(&format!("{}!", "a".repeat(42))));
     }
 
     fn hm(pairs: &[(&str, &str)]) -> axum::http::HeaderMap {

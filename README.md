@@ -49,7 +49,11 @@ Redirect URIs are allowlisted (`WARDEN_OAUTH_REDIRECT_ALLOW`; default `https://c
 
 Optional hardening: Anthropic's outbound ranges are `160.79.104.0/21` and `153.61.208.0/20`. You may restrict `/mcp`, `/token`, `/register` and `/.well-known/*` at the proxy to them. Do not restrict `/authorize` the same way: that page is opened by your own browser, not by Anthropic, so an allowlist of Anthropic ranges would block you. Exempt `/authorize` (or limit it to your own IP / VPN instead).
 
-Behind a reverse proxy, set `WARDEN_TRUSTED_PROXIES` (comma-separated IPs/CIDRs of the proxy as warden sees it). Without it all clients look like the proxy to the failed-login limiters.
+Behind a reverse proxy, set `WARDEN_TRUSTED_PROXIES` (comma-separated IPs/CIDRs of the proxy **as warden sees it**; in Docker that is the bridge gateway or the proxy container, e.g. `172.16.0.0/12`, never `127.0.0.1`). It defaults to empty, and then all clients look like the proxy to the rate limiters; warden logs a warning at startup if OAuth is enabled without it.
+
+Once the connector is working, set `WARDEN_OAUTH_REGISTRATION=closed` (default `open`) to switch dynamic client registration off: `/register` then returns 403 and the metadata omits `registration_endpoint`. Existing connectors keep working; set it back to `open` to add another.
+
+The `consumer` argument of the MCP tools (a cursor name, `^[a-zA-Z0-9._:-]{1,64}$`) is not a security boundary: any authenticated caller can name any consumer, including the `oauth:<name>` cursor of a connector. warden is single-user, so this is deliberate.
 
 Docker image, compose file and reverse proxy setup: see [docs/deploy.md](docs/deploy.md).
 

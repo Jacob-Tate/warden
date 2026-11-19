@@ -46,7 +46,19 @@ WARDEN_TRUSTED_PROXIES=172.18.0.0/16        # the proxy's address as warden sees
 NVD_API_KEY=                                # optional: 50 instead of 5 requests / 30 s
 ```
 
-`WARDEN_PUBLIC_URL` is used for OAuth metadata and links; it must match the URL clients use. `WARDEN_TRUSTED_PROXIES` takes IPs/CIDRs of the proxy; without it every client looks like the proxy to the rate limiters. With the default `127.0.0.1:8080` port mapping and a proxy on the host, warden sees the Docker bridge gateway (commonly `172.17.0.1`; check `docker network inspect`) rather than 127.0.0.1.
+`WARDEN_PUBLIC_URL` is used for OAuth metadata and links; it must match the URL clients use.
+
+**`WARDEN_TRUSTED_PROXIES` must contain the proxy as the container sees it.** It defaults to empty, and then every client looks like the proxy to the rate limiters (one shared budget for everyone, so a single attacker can exhaust the failure limits that protect you, and your own logins share them). Inside Docker the proxy is never `127.0.0.1`:
+
+- Proxy on the host, port published as `127.0.0.1:8080:8080`: warden sees the Docker bridge gateway (commonly `172.17.0.1`; check `docker network inspect bridge`). Use the whole bridge range `172.16.0.0/12` if you are unsure; it covers every default Docker bridge and compose network.
+- Proxy in a container on a shared Docker network: use that network's subnet (`docker network inspect proxy`) or the proxy container's IP.
+- Proxy on another machine: that machine's address.
+
+Only list real proxies: a trusted peer chooses the client address with `X-Forwarded-For`. warden logs a WARNING at startup when OAuth is enabled and the list is empty.
+
+`WARDEN_OAUTH_REGISTRATION=open|closed` (default `open`). Claude registers itself through dynamic client registration (`/register`), so leave it `open` while you connect the connector. Afterwards set it to `closed` (and restart): `/register` then answers 403 and the metadata no longer advertises a registration endpoint, so nobody can create client rows at all. Already registered connectors keep working. While `open`, the registry holds at most 50 clients and never evicts one that is younger than an hour or has ever obtained a token; when full, registration is refused (503) instead.
+
+Hash a new passphrase with `hash-passphrase` to get the current argon2id parameters (64 MiB, 3 passes); hashes made earlier keep working. The consent page checks at most 2 passphrases at a time (a third waits up to 2 s, then gets 429), so budget about 130 MiB of RAM for it under attack.
 
 ## 3. Start
 
@@ -163,7 +175,9 @@ Migrations run on start. Pin a tag (`ghcr.io/jacob-tate/warden:v0.1.0` or `:sha-
 |---|---|
 | `403 Forbidden: Host header is not allowed` | The proxy is not forwarding the original `Host`, or `WARDEN_PUBLIC_URL` does not match the hostname clients use. |
 | `401` on `/mcp` | Missing or wrong bearer token. Use the key printed by `hash-key`, not the hash. The log warns when `WARDEN_API_KEYS` is empty. |
-| Lockouts / rate limits hit everyone | `WARDEN_TRUSTED_PROXIES` unset or wrong; all clients appear as the proxy. |
+| Lockouts / rate limits hit everyone | `WARDEN_TRUSTED_PROXIES` unset or wrong; all clients appear as the proxy (see the startup WARNING and section 2). |
+| `403 access_denied` from `/register` | `WARDEN_OAUTH_REGISTRATION=closed`. Set it to `open`, connect the connector, close it again. |
+| `/register` answers 503 | Client registry full of young or in-use clients; wait for the oldest unused one to pass an hour, or remove rows from `oauth_clients`. |
 | claude.ai "Couldn't reach the MCP server" | No public A record, hostname resolves privately, WAF blocks `/.well-known/*`, or the proxy strips `WWW-Authenticate`. |
 | Consent page 404 | `WARDEN_OWNER_PASSPHRASE_HASH` unset (OAuth disabled) or `$` mangled; use single quotes. |
 | `/healthz` says `stale` | A core source (cvelist, KEV) is out of date: no sync yet, or egress blocked. Check logs; run `docker compose exec warden warden sync-once`. |

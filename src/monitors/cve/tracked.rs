@@ -14,6 +14,86 @@ use super::sources::{SourceContext, nvd_api::NvdApi};
 use crate::db::{Db, match_repo, repo};
 use crate::model::{TrackedProduct, now_rfc3339};
 
+/// A mistake in the caller's input; the message is safe and useful to show to the user
+/// (everything else is an internal error whose details stay in the log).
+#[derive(Debug)]
+pub struct UserError(pub String);
+
+impl std::fmt::Display for UserError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for UserError {}
+
+/// Most items in each override list.
+pub const MAX_LIST_ITEMS: usize = 50;
+/// Longest string in an override list (or inside its items).
+pub const MAX_STRING_CHARS: usize = 200;
+/// Longest product name.
+pub const MAX_NAME_CHARS: usize = 100;
+
+fn check_len(what: &str, s: &str, max: usize) -> Result<(), UserError> {
+    if s.chars().count() > max {
+        return Err(UserError(format!(
+            "{what} is too long (max {max} characters)"
+        )));
+    }
+    Ok(())
+}
+
+fn check_list<T>(
+    what: &str,
+    list: Option<&Vec<T>>,
+    strings: impl Fn(&T) -> Vec<&str>,
+) -> Result<(), UserError> {
+    let Some(list) = list else { return Ok(()) };
+    if list.len() > MAX_LIST_ITEMS {
+        return Err(UserError(format!(
+            "{what} has {} items (max {MAX_LIST_ITEMS})",
+            list.len()
+        )));
+    }
+    for item in list {
+        for s in strings(item) {
+            check_len(&format!("an entry of {what}"), s, MAX_STRING_CHARS)?;
+        }
+    }
+    Ok(())
+}
+
+/// Reject oversized override lists/strings before any work is done.
+pub fn validate_overrides(o: &Overrides) -> Result<(), UserError> {
+    if let Some(n) = &o.name {
+        check_len("name", n, MAX_NAME_CHARS)?;
+    }
+    check_list("cpes", o.cpes.as_ref(), |c| {
+        vec![&c.part, &c.vendor, &c.product]
+    })?;
+    check_list("cna_names", o.cna_names.as_ref(), |c| {
+        vec![&c.vendor, &c.product]
+    })?;
+    check_list("kev_names", o.kev_names.as_ref(), |k| {
+        vec![&k.vendor_project, &k.product]
+    })?;
+    check_list("aliases", o.aliases.as_ref(), |s| vec![s.as_str()])?;
+    check_list("keywords", o.keywords.as_ref(), |s| vec![s.as_str()])?;
+    check_list("exclude_keywords", o.exclude_keywords.as_ref(), |s| {
+        vec![s.as_str()]
+    })?;
+    Ok(())
+}
+
+/// Unwrap a row that was just written; a concurrent `remove` can make it vanish.
+fn require_saved<T>(row: Option<T>, id: &str) -> Result<T> {
+    row.ok_or_else(|| {
+        anyhow::Error::new(UserError(format!(
+            "product `{id}` was removed while it was being saved; try again"
+        )))
+    })
+}
+
 /// Most KEV CVEs fetched from NVD in one go (NVD allows ~10 requests/minute without a key).
 const MAX_KEV_FETCH: usize = 15;
 
@@ -104,6 +184,8 @@ pub async fn add(
     if product.id.is_empty() {
         bail!("product name has no letters or digits");
     }
+    check_len("name", &product.name, MAX_NAME_CHARS)?;
+    super::matcher::check_patterns(&product).map_err(UserError)?;
     let now = now_rfc3339();
     if product.created_at.is_empty() {
         product.created_at = now.clone();
@@ -112,14 +194,15 @@ pub async fn add(
     let p = product.clone();
     ctx.db.call(move |c| repo::upsert_product(c, &p)).await?;
 
-    let saved = ctx
-        .db
-        .call({
-            let id = product.id.clone();
-            move |c| repo::get_product(c, &id)
-        })
-        .await?
-        .expect("just upserted");
+    let saved = require_saved(
+        ctx.db
+            .call({
+                let id = product.id.clone();
+                move |c| repo::get_product(c, &id)
+            })
+            .await?,
+        &product.id,
+    )?;
     let mut kev_fetched = 0;
     if let Some(api) = api {
         let min = DateTime::parse_from_rfc3339(&saved.created_at)
@@ -131,11 +214,15 @@ pub async fn add(
             .len();
     }
     let id = saved.id.clone();
-    let stats = ctx
-        .db
-        .call(move |c| match_repo::rematch_product(c, &id))
-        .await?
-        .expect("just upserted");
+    let stats = require_saved(
+        ctx.db
+            .call({
+                let id = id.clone();
+                move |c| match_repo::rematch_product(c, &id)
+            })
+            .await?,
+        &id,
+    )?;
     Ok(AddResult {
         product: saved,
         candidates: stats.candidates,
@@ -255,6 +342,43 @@ mod tests {
             score: 1.0,
             evidence: Default::default(),
         }
+    }
+
+    #[test]
+    fn vanished_row_is_an_error_not_a_panic() {
+        assert_eq!(require_saved(Some(5), "x").unwrap(), 5);
+        let e = require_saved::<u8>(None, "widget").unwrap_err();
+        assert!(e.downcast_ref::<UserError>().is_some());
+        assert!(format!("{e:#}").contains("widget"));
+    }
+
+    #[test]
+    fn overrides_are_capped() {
+        let ok = Overrides {
+            keywords: Some(vec!["x".repeat(MAX_STRING_CHARS)]),
+            ..Default::default()
+        };
+        assert!(validate_overrides(&ok).is_ok());
+        let long = Overrides {
+            aliases: Some(vec!["x".repeat(MAX_STRING_CHARS + 1)]),
+            ..Default::default()
+        };
+        assert!(validate_overrides(&long).unwrap_err().0.contains("aliases"));
+        let many = Overrides {
+            exclude_keywords: Some(vec!["k".into(); MAX_LIST_ITEMS + 1]),
+            ..Default::default()
+        };
+        assert!(
+            validate_overrides(&many)
+                .unwrap_err()
+                .0
+                .contains("exclude_keywords")
+        );
+        let name = Overrides {
+            name: Some("n".repeat(MAX_NAME_CHARS + 1)),
+            ..Default::default()
+        };
+        assert!(validate_overrides(&name).is_err());
     }
 
     #[tokio::test]

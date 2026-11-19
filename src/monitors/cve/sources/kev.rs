@@ -116,7 +116,7 @@ impl KevSource {
             .get(reqwest::header::ETAG)
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned);
-        let body = resp.bytes().await.context("reading KEV body")?;
+        let body = super::read_body_capped(resp, &self.url, super::MAX_KEV_BYTES).await?;
         let (new_cursor, entries) = parse_catalog(&body, &now_rfc3339())?;
         let total = entries.len();
         let json = serde_json::to_string(&new_cursor)?;

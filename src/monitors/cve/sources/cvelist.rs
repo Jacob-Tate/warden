@@ -543,17 +543,31 @@ pub fn parse_record(bytes: &[u8]) -> Result<CvelistUpsert> {
 
 /// Largest single JSON entry accepted from a zip (zip-bomb guard).
 const MAX_ENTRY_BYTES: u64 = 20 * 1024 * 1024;
+/// Most entries accepted in one zip (the full cvelistV5 delta is far smaller).
+const MAX_ZIP_ENTRIES: usize = 100_000;
 
 #[derive(Debug, Default)]
 struct ApplyStats {
     out: SyncOutcome,
     max_date_updated: Option<String>,
     parse_errors: usize,
+    /// Records skipped because their `dateUpdated` is not a valid timestamp.
+    bad_timestamps: usize,
 }
 
 fn apply_zip(conn: &mut Connection, zip_bytes: &[u8]) -> DbResult<ApplyStats> {
     let mut archive = zip::ZipArchive::new(Cursor::new(zip_bytes))
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    if archive.len() > MAX_ZIP_ENTRIES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "zip has {} entries (limit {MAX_ZIP_ENTRIES})",
+                archive.len()
+            ),
+        )
+        .into());
+    }
     let tx = conn.transaction()?;
     let mut st = ApplyStats::default();
     let mut buf = Vec::new();
@@ -561,7 +575,7 @@ fn apply_zip(conn: &mut Connection, zip_bytes: &[u8]) -> DbResult<ApplyStats> {
         let mut entry = archive
             .by_index(i)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
-        let name = entry.name().to_owned();
+        let name = entry.name().map(|n| n.into_owned()).unwrap_or_default();
         let file = name.rsplit('/').next().unwrap_or(&name);
         if !entry.is_file() || !file.starts_with("CVE-") || !file.ends_with(".json") {
             continue;
@@ -583,6 +597,10 @@ fn apply_zip(conn: &mut Connection, zip_bytes: &[u8]) -> DbResult<ApplyStats> {
         };
         match upsert_cvelist(&tx, &rec)? {
             UpsertResult::Skipped => st.out.skipped += 1,
+            UpsertResult::Rejected => {
+                st.out.skipped += 1;
+                st.bad_timestamps += 1;
+            }
             r => {
                 st.out.changed += 1;
                 st.out.changed_ids.push(rec.cve_id.clone());
@@ -600,6 +618,12 @@ fn apply_zip(conn: &mut Connection, zip_bytes: &[u8]) -> DbResult<ApplyStats> {
         }
     }
     tx.commit()?;
+    if st.bad_timestamps > 0 {
+        tracing::warn!(
+            records = st.bad_timestamps,
+            "cvelist: records skipped because dateUpdated is not a valid timestamp"
+        );
+    }
     Ok(st)
 }
 
@@ -667,11 +691,7 @@ impl CvelistSource {
             .with_context(|| format!("GET {url}"))?
             .error_for_status()
             .with_context(|| format!("GET {url}"))?;
-        Ok(resp
-            .bytes()
-            .await
-            .with_context(|| format!("reading {url}"))?
-            .to_vec())
+        super::read_body_capped(resp, url, super::MAX_ZIP_BYTES).await
     }
 
     async fn run(&self, ctx: &SourceContext) -> Result<SyncOutcome> {
@@ -845,6 +865,27 @@ mod tests {
             assert_eq!(d, "changed");
             assert_eq!(lm, "2099-01-01T00:00:00.000Z");
             assert!(n >= 2, "affected rows replaced, not duplicated: {n}");
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn unparseable_timestamp_is_rejected_not_stored() {
+        let db = Db::open_in_memory().unwrap();
+        db.with_conn(|c| {
+            let mut r = rec("CVE-2024-10441");
+            r.date_updated = "zzzz-not-a-date".into();
+            assert_eq!(upsert_cvelist(c, &r)?, UpsertResult::Rejected);
+            let n: i64 = c.query_row("SELECT count(*) FROM cves", [], |row| row.get(0))?;
+            assert_eq!(n, 0, "nothing stored for a bad timestamp");
+            // a good record, then a bad "newer" one: the bad one cannot freeze the row
+            let good = rec("CVE-2024-10441");
+            assert_eq!(upsert_cvelist(c, &good)?, UpsertResult::Inserted);
+            assert_eq!(upsert_cvelist(c, &r)?, UpsertResult::Rejected);
+            let mut newer = good.clone();
+            newer.date_updated = "2099-01-01T00:00:00.000Z".into();
+            assert_eq!(upsert_cvelist(c, &newer)?, UpsertResult::Updated);
             Ok(())
         })
         .unwrap();

@@ -6,6 +6,12 @@ services:
     container_name: warden
     restart: unless-stopped
     env_file: .env
+    # IMPORTANT: set WARDEN_TRUSTED_PROXIES in .env to the reverse proxy as THIS CONTAINER sees it.
+    # With the published port below (proxy on the host) that is the Docker bridge gateway, not
+    # 127.0.0.1: use 172.16.0.0/12 (every default Docker bridge/compose network) or the exact
+    # gateway from `docker network inspect`. With a shared network, use that network's subnet or
+    # the proxy container's IP. Left empty, all clients look like the proxy and share one set of
+    # rate-limit budgets (warden logs a startup WARNING when OAuth is on and this is empty).
     environment:
       # Fixed for the container layout; these override any value in .env
       WARDEN_DB_PATH: /data/warden.db

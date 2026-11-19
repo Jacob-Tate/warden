@@ -16,7 +16,10 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::{Source, SourceContext, SyncOutcome, download_to_temp, nvd_parse, to_hex, tracked};
+use super::{
+    CapReader, MAX_DECOMPRESSED_BYTES, MAX_NVD_GZ_BYTES, Source, SourceContext, SyncOutcome,
+    download_to_temp, nvd_parse, to_hex, tracked,
+};
 use crate::db::{
     DbResult,
     cve_repo::{UpsertResult, load_cursor, save_cursor, upsert_nvd},
@@ -70,6 +73,7 @@ struct FeedStats {
     out: SyncOutcome,
     max_last_modified: Option<String>,
     sha256: String,
+    bad_timestamps: usize,
 }
 
 /// Apply a feed file (gzip or plain JSON) in one transaction.
@@ -85,7 +89,10 @@ fn apply_feed(
     // reqwest may already have inflated a `Content-Encoding: gzip` response.
     let file = std::fs::File::open(&path)?;
     let plain: Box<dyn Read> = if n == 2 && magic == [0x1f, 0x8b] {
-        Box::new(flate2::read::GzDecoder::new(BufReader::new(file)))
+        Box::new(CapReader::new(
+            flate2::read::GzDecoder::new(BufReader::new(file)),
+            MAX_DECOMPRESSED_BYTES,
+        ))
     } else {
         Box::new(file)
     };
@@ -108,6 +115,10 @@ fn apply_feed(
         let lm = rec.last_modified.clone();
         match upsert_nvd(&tx, &rec).map_err(|e| anyhow::anyhow!("{e}"))? {
             UpsertResult::Skipped => stats.out.skipped += 1,
+            UpsertResult::Rejected => {
+                stats.out.skipped += 1;
+                stats.bad_timestamps += 1;
+            }
             r => {
                 stats.out.changed += 1;
                 if r == UpsertResult::Inserted {
@@ -126,6 +137,12 @@ fn apply_feed(
         Ok(())
     });
     parse.map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{e:#}")))?;
+    if stats.bad_timestamps > 0 {
+        tracing::warn!(
+            records = stats.bad_timestamps,
+            "nvd_feed: records skipped because lastModified is not a valid timestamp"
+        );
+    }
     // Hash the whole stream, including anything after the JSON document.
     io::copy(&mut reader, &mut io::sink())?;
     let digest = reader.into_inner().hasher.finalize();
@@ -175,7 +192,7 @@ impl NvdFeedSource {
         }
 
         let started = std::time::Instant::now();
-        let tmp = download_to_temp(&ctx.http, &self.feed_url).await?;
+        let tmp = download_to_temp(&ctx.http, &self.feed_url, MAX_NVD_GZ_BYTES).await?;
         let path = tmp.path().to_path_buf();
         let stats = ctx
             .db
