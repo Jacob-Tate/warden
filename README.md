@@ -8,7 +8,27 @@ SSL certificate and HTTP uptime monitors are planned for later.
 
 ## Status
 
-Early planning. Nothing to run yet.
+The CVE sync, matching, discovery and the MCP server (API-key auth) work. OAuth for claude.ai connectors is next.
+
+## Quick start
+
+```bash
+cargo build --release
+./target/release/warden hash-key claude-code     # prints the key once + the config line
+export WARDEN_API_KEYS=claude-code:<hash printed above>
+export WARDEN_PUBLIC_URL=https://warden.example.com   # host is allowed on /mcp
+./target/release/warden serve                    # listens on WARDEN_BIND (default 0.0.0.0:8080)
+```
+
+Several keys: `WARDEN_API_KEYS=claude-code:<hash>,routine:<hash>`. Each key name is that client's default `consumer`, so every client has its own "already seen" cursor.
+
+Connect Claude Code:
+
+```bash
+claude mcp add --transport http warden https://HOST/mcp --header "Authorization: Bearer KEY"
+```
+
+Put an HTTPS reverse proxy in front (forward `Host`, do not buffer `/mcp`). `/healthz` is unauthenticated and reports only `ok` or `stale`.
 
 ## Planned design
 

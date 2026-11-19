@@ -4,7 +4,7 @@
 //! subcommands run one operation against the configured database and exit (see
 //! `warden help`).
 
-// Phase 2 (MCP/OAuth) code is not wired up yet.
+// Some model/db helpers are only used by tests or by Phase 2b (OAuth).
 #![allow(dead_code)]
 
 mod auth;
@@ -41,6 +41,7 @@ USAGE:
   warden feed [--consumer X] [--limit N] [--product P] [--min-cvss S] [--include-acked] [--ack]
                                      print what is new for a consumer (default `cli`); --ack consumes it
   warden cve <CVE-ID>                print the full record of one CVE
+  warden hash-key [name]             generate an API key (printed once) and its WARDEN_API_KEYS entry
 
 Environment: see .env.example (WARDEN_DB_PATH, WARDEN_SYNC_INTERVAL, WARDEN_RETENTION_DAYS, ...).";
 
@@ -114,6 +115,13 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     let args = Args::parse(raw.get(1..).unwrap_or_default());
+    if cmd == "hash-key" {
+        print!(
+            "{}",
+            auth::hash_key_command(args.positional.first().map(String::as_str))?
+        );
+        return Ok(());
+    }
 
     let config = Arc::new(config::Config::from_env()?);
     let db = db::Db::open(&config.db_path)
@@ -240,19 +248,36 @@ async fn main() -> Result<()> {
 }
 
 async fn serve(config: Arc<config::Config>, db: db::Db, syncer: Arc<Syncer>) -> Result<()> {
-    let scheduler = tokio::spawn(sync::run_scheduler(syncer, config.sync_interval));
+    let keys = auth::ApiKeyValidator::parse(&config.api_keys).context("WARDEN_API_KEYS")?;
+    if keys.is_empty() {
+        tracing::warn!(
+            "WARDEN_API_KEYS is empty: every /mcp request will be rejected (run `warden hash-key`)"
+        );
+    }
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let scheduler = tokio::spawn(sync::run_scheduler(syncer.clone(), config.sync_interval));
     let app = http::router(http::AppState {
         db,
         config: config.clone(),
+        syncer,
+        validators: vec![Arc::new(keys)],
+        shutdown: shutdown.clone(),
     });
     let listener = tokio::net::TcpListener::bind(config.bind)
         .await
         .with_context(|| format!("binding {}", config.bind))?;
     tracing::info!(addr = %config.bind, public_url = %config.public_url, "listening");
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    let stop = shutdown.clone();
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        shutdown_signal().await;
+        stop.cancel();
+    })
+    .await?;
     scheduler.abort();
     tracing::info!("shut down");
     Ok(())

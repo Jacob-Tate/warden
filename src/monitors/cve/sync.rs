@@ -139,6 +139,17 @@ pub struct Syncer {
     pub retention_days: i64,
     pub backfill_days: i64,
     running: tokio::sync::Mutex<()>,
+    last_run: std::sync::Mutex<Option<LastRun>>,
+    last_started: std::sync::Mutex<Option<DateTime<Utc>>>,
+}
+
+/// Outcome of the most recent finished pass, kept in memory for `sync_status`.
+#[derive(Debug, Clone)]
+pub struct LastRun {
+    pub started_at: DateTime<Utc>,
+    pub finished_at: DateTime<Utc>,
+    pub ok: bool,
+    pub line: String,
 }
 
 impl Syncer {
@@ -158,11 +169,31 @@ impl Syncer {
             retention_days,
             backfill_days,
             running: tokio::sync::Mutex::new(()),
+            last_run: std::sync::Mutex::new(None),
+            last_started: std::sync::Mutex::new(None),
         }
     }
 
     pub fn db(&self) -> &Db {
         &self.ctx.db
+    }
+
+    /// The most recent finished pass of this process, if any.
+    pub fn last_run(&self) -> Option<LastRun> {
+        self.last_run
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// When the most recent pass (running or finished) started.
+    pub fn last_started(&self) -> Option<DateTime<Utc>> {
+        *self.last_started.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Whether a pass is running right now.
+    pub fn is_running(&self) -> bool {
+        self.running.try_lock().is_err()
     }
 
     /// Run one full pass now. Returns `None` (without doing anything) if a run is
@@ -172,7 +203,15 @@ impl Syncer {
             tracing::info!("sync already running; skipping");
             return None;
         };
+        let started_at = Utc::now();
+        *self.last_started.lock().unwrap_or_else(|e| e.into_inner()) = Some(started_at);
         let summary = self.run().await;
+        *self.last_run.lock().unwrap_or_else(|e| e.into_inner()) = Some(LastRun {
+            started_at,
+            finished_at: Utc::now(),
+            ok: summary.failed_sources().is_empty() && summary.errors.is_empty(),
+            line: summary.line(),
+        });
         if summary.failed_sources().is_empty() && summary.errors.is_empty() {
             tracing::info!("{}", summary.line());
         } else {

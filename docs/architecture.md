@@ -1,4 +1,4 @@
-# warden architecture (Phase 1d)
+# warden architecture (Phase 2a)
 
 ## Module map
 
@@ -8,8 +8,9 @@
 | `db` | r2d2 pool (WAL, busy_timeout, foreign keys), `rusqlite_migration` migrations, `db::repo` functions (tracked products, per-source cursor/status). `Db::call` runs closures on the blocking pool. |
 | `model` | Shared types: `TrackedProduct`, `CveRecord`, `Cvss`, `KevEntry`, `EpssScore`, `Delivered`, `SourceStatus`, `FeedItem`, `FeedEnvelope`. |
 | `monitors::cve` | First monitor. `normalize`, `matcher`, `discovery`, `sources/{cvelist,nvd_feed,nvd_api,kev,epss}` (`Source` trait, typed cursors), `sync` (orchestration, scheduler, retention), `feed` (`get_new`, `ack`, `cve_detail`), `tracked` (add/update/remove/list helpers for MCP and the CLI). |
-| `http` | axum router; `/healthz` only. |
-| `mcp`, `auth` | Empty placeholders for Phase 2 (rmcp, API key + OAuth AS). |
+| `http` | axum router: `/healthz` (unauthenticated; only `{"status":"ok"|"stale"}`, 503 `degraded` if the DB is down) and `/mcp` behind auth, a 1 MB body limit and a 120 s request timeout. |
+| `mcp` | rmcp 3.11 server: stateless streamable HTTP with JSON responses, built per request by the service factory. |
+| `auth` | Bearer-token middleware, `TokenValidator` trait, API-key validator, failed-auth limiter, `hash-key`. OAuth AS arrives in Phase 2b. |
 
 Future SSL/uptime monitors become siblings of `monitors::cve`. No shared plugin trait yet.
 
@@ -48,7 +49,32 @@ Discovery merges CPE rows with the same `vendor:product` across parts (`a`/`o`/`
 
 ## CLI
 
-`warden [serve]` (HTTP + scheduler), `sync-once`, `discover <name>`, `track-add <name> [--pick N]`, `tracked`, `rematch`, `feed [--consumer X] [--limit N] [--product P] [--min-cvss S] [--include-acked] [--ack]`, `cve <id>`. Logs go to stderr; JSON results to stdout. Config comes from the environment (`.env.example`).
+`warden [serve]` (HTTP + scheduler), `hash-key [name]` (new API key + config line), `sync-once`, `discover <name>`, `track-add <name> [--pick N]`, `tracked`, `rematch`, `feed [--consumer X] [--limit N] [--product P] [--min-cvss S] [--include-acked] [--ack]`, `cve <id>`. Logs go to stderr; JSON results to stdout. Config comes from the environment (`.env.example`).
+
+## MCP server (`mcp`)
+
+Mounted at `/mcp`, stateless (`with_legacy_session_mode(false)`, `NeverSessionManager`, `with_json_response(true)`): no `Mcp-Session-Id`, no server push (so no progress notifications; long tools simply run up to their own timeout while other requests proceed). Server name `warden`, version from Cargo, `instructions` describe the get -> summarize -> ack loop and discover-before-add. Allowed hosts: `localhost`, `127.0.0.1`, `::1` and the host of `WARDEN_PUBLIC_URL`; allowed origins: the public origin, `https://claude.ai`, loopback (requests without `Origin` pass). Host/Origin failures are 403 (they are checked after auth, so only authenticated callers see them).
+
+| Tool | Purpose |
+|---|---|
+| `get_new_cves {consumer?, limit?, product?, min_cvss?}` | `FeedEnvelope` for the consumer; read-only. |
+| `ack {consumer?, cve_ids}` | Mark seen; returns `{acked, consumer}`. Ids validated against `^CVE-\d{4}-\d{4,}$`. |
+| `cve_detail {cve_id}` | Full record; id validated before any network call. |
+| `list_tracked {}` | Products with definitions and match counts. |
+| `discover_product {name}` | Discovery candidates, each with an `index`; results cached 15 min per name; 60 s overall timeout. |
+| `add_tracked {name, candidate_index?, overrides?}` | Uses the cached/new discovery, saves candidate N (default 0) with `overrides` (cpes, cna_names, kev_names, aliases, keywords, exclude_keywords, match_mode). If discovery fails and `overrides` has cpes/keywords, saves a manual product. Returns the saved product and initial match counts. |
+| `update_tracked {id, name?, cpes?, ...}` / `remove_tracked {id}` | Edit (re-matches) / delete. |
+| `sync_status {}` | Per-source health, `stale`, `running`, last run summary (in-memory, this process). |
+| `trigger_sync {}` | Spawns a sync and returns; refused if a pass started < 5 min ago (scheduler runs count) or one is running. |
+
+User mistakes (bad id, unknown product, rate limit, discovery timeout) are tool results with `isError: true` and an actionable message; only internal serialization failures are protocol errors.
+
+## Auth (`auth`)
+
+- `/mcp` needs `Authorization: Bearer <key>`. `WARDEN_API_KEYS` is a comma-separated list of `name:sha256hex` (no plaintext keys are accepted). `warden hash-key [name]` makes a random 32-byte key (base64url), prints it once and the config line. Validation hashes the presented token and compares against every entry in constant time (`subtle`).
+- Failure: `401` with `WWW-Authenticate: Bearer resource_metadata="<public_url>/.well-known/oauth-protected-resource"`. In-memory per-peer-IP limiter: 10 failures in 5 minutes -> `429` (+ `Retry-After`) for that IP; it uses the TCP peer address (behind a reverse proxy this is the proxy's address, so a flood of bad tokens can lock out everyone for 5 minutes; fix later by trusting a forwarded header from a known proxy).
+- `TokenValidator` (async `validate(&str) -> Option<Principal>`) is the extension point: `AppState.validators` is tried in order; Phase 2b adds an OAuth access-token validator beside `ApiKeyValidator`.
+- Principal -> consumer: the middleware puts `Principal{name}` in the request extensions; rmcp copies the HTTP `Parts` into the MCP request context, and `get_new_cves`/`ack` read it (`Extension<Parts>`) to default `consumer` to the key name (explicit `consumer` wins; fallback `default`). Separate keys therefore have separate ack cursors.
 
 ## Schema
 
@@ -65,4 +91,5 @@ Applied: cvelist/NVD/KEV/EPSS roles and per-source cursors; normalized record pr
 Deviations / notes:
 - `tracked_products.id` is a slug and `discovery_evidence` is not stored yet (add if discovery needs it).
 - `r2d2_sqlite` 0.34 / `rusqlite` 0.39 / `rusqlite_migration` 2.5 chosen as the newest set that shares one `libsqlite3-sys` and builds on rustc 1.94 (newer releases need 1.95). `scheduled-thread-pool` is pinned to 0.2.7 in `Cargo.lock` for the same reason.
-- `#![allow(dead_code)]` stays at the crate root until the Phase 2 MCP/auth code uses the remaining helpers.
+- `#![allow(dead_code)]` stays at the crate root (some model/db helpers are test-only or wait for Phase 2b).
+- Discovery's CVE probe samples the newest CVEs for a CPE (count query, then a 120-day `pubStartDate` window, falling back to the last page `startIndex = total - 5`), newest first: the oldest records carry vendor `n/a` and teach no CNA names.

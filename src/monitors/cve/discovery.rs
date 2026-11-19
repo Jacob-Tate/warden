@@ -205,6 +205,42 @@ pub struct HttpNet {
     next_slot: Mutex<Instant>,
 }
 
+/// Days of recent CVEs sampled when learning CNA names (NVD's maximum range is 120).
+const RECENT_DAYS: i64 = 120;
+/// Sample CVEs kept per probed candidate.
+const SAMPLE_PAGE: u64 = 5;
+
+/// `pubStartDate` / `pubEndDate` values (UTC, NVD extended ISO format) for the last `days`.
+fn recent_window(now: chrono::DateTime<chrono::Utc>, days: i64) -> (String, String) {
+    let f = |t: chrono::DateTime<chrono::Utc>| t.format("%Y-%m-%dT%H:%M:%S%.3f").to_string();
+    (f(now - chrono::Duration::days(days)), f(now))
+}
+
+fn vulnerabilities(page: &Value) -> Vec<Value> {
+    page.get("vulnerabilities")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Order NVD `vulnerabilities` entries by `cve.published` descending (id as tie
+/// break); entries without a date go last.
+fn sort_newest_first(v: &mut [Value]) {
+    let key = |x: &Value| {
+        (
+            x.pointer("/cve/published")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned(),
+            x.pointer("/cve/id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned(),
+        )
+    };
+    v.sort_by_key(|b| std::cmp::Reverse(key(b)));
+}
+
 fn pct(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
@@ -306,12 +342,53 @@ impl Net for HttpNet {
     }
 
     async fn cve_probe(&self, cpe_prefix: &str) -> Result<Value> {
-        let url = format!(
-            "{}/cves/2.0?virtualMatchString={}&resultsPerPage=5",
+        let base = format!(
+            "{}/cves/2.0?virtualMatchString={}",
             self.nvd_base,
             pct(cpe_prefix)
         );
-        self.get(&url, true).await
+        // 1. Total count only.
+        let head = self.get(&format!("{base}&resultsPerPage=1"), true).await?;
+        let total = head
+            .get("totalResults")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        if total == 0 {
+            return Ok(head);
+        }
+        // 2. Recently published CVEs (NVD caps a date range at 120 days). The oldest
+        // records of a CPE say "n/a" for vendor/product, so they teach nothing.
+        let (start, end) = recent_window(chrono::Utc::now(), RECENT_DAYS);
+        let mut vulns = match self
+            .get(
+                &format!("{base}&pubStartDate={start}&pubEndDate={end}&resultsPerPage=20"),
+                true,
+            )
+            .await
+        {
+            Ok(v) => vulnerabilities(&v),
+            Err(e) => {
+                tracing::debug!("recent CVE window query failed: {e:#}");
+                vec![]
+            }
+        };
+        // 3. Nothing recent: the last page of the unfiltered list.
+        if vulns.is_empty() {
+            let from = total.saturating_sub(SAMPLE_PAGE);
+            let page = self
+                .get(
+                    &format!("{base}&startIndex={from}&resultsPerPage={SAMPLE_PAGE}"),
+                    true,
+                )
+                .await?;
+            vulns = vulnerabilities(&page);
+        }
+        sort_newest_first(&mut vulns);
+        vulns.truncate(SAMPLE_PAGE as usize);
+        Ok(serde_json::json!({
+            "totalResults": total,
+            "vulnerabilities": vulns,
+        }))
     }
 
     async fn cve_record(&self, cve_id: &str) -> Result<Value> {
@@ -1324,6 +1401,95 @@ mod tests {
         assert_eq!(aggs[0].other_parts, ["o"]);
         assert_eq!(aggs[0].counts.total, 3);
         assert_eq!(aggs[0].counts.live, 3);
+    }
+
+    #[test]
+    fn recent_window_is_120_days_back() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-19T12:30:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let (a, b) = recent_window(now, 120);
+        assert_eq!(b, "2026-11-19T12:30:00.000");
+        assert_eq!(a, "2026-07-22T12:30:00.000");
+    }
+
+    #[test]
+    fn samples_newest_cves_first() {
+        let mut v = vec![
+            serde_json::json!({"cve": {"id": "CVE-2010-0001", "published": "2010-01-01T00:00:00.000"}}),
+            serde_json::json!({"cve": {"id": "CVE-2026-0002", "published": "2026-10-01T00:00:00.000"}}),
+            serde_json::json!({"cve": {"id": "CVE-2026-0003", "published": "2026-11-01T00:00:00.000"}}),
+            serde_json::json!({"cve": {"id": "CVE-1999-0001"}}),
+        ];
+        sort_newest_first(&mut v);
+        let ids: Vec<&str> = v.iter().map(|x| x["cve"]["id"].as_str().unwrap()).collect();
+        assert_eq!(
+            ids,
+            [
+                "CVE-2026-0003",
+                "CVE-2026-0002",
+                "CVE-2010-0001",
+                "CVE-1999-0001"
+            ]
+        );
+    }
+
+    /// Serve canned JSON bodies in order on a local port; returns the base URL and
+    /// the request lines seen.
+    async fn canned_server(bodies: Vec<String>) -> (String, std::sync::Arc<Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", l.local_addr().unwrap());
+        let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let seen2 = seen.clone();
+        tokio::spawn(async move {
+            for body in bodies {
+                let (mut s, _) = l.accept().await.unwrap();
+                let mut buf = vec![0u8; 8192];
+                let n = s.read(&mut buf).await.unwrap();
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                seen2
+                    .lock()
+                    .unwrap()
+                    .push(req.lines().next().unwrap_or("").to_owned());
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                s.write_all(resp.as_bytes()).await.unwrap();
+            }
+        });
+        (base, seen)
+    }
+
+    #[tokio::test]
+    async fn http_probe_prefers_recent_window_then_last_page() {
+        let head = r#"{"totalResults":40,"vulnerabilities":[]}"#.to_owned();
+        let recent = r#"{"totalResults":2,"vulnerabilities":[
+            {"cve":{"id":"CVE-2026-1","published":"2026-09-01T00:00:00.000"}},
+            {"cve":{"id":"CVE-2026-2","published":"2026-10-01T00:00:00.000"}}]}"#
+            .to_owned();
+        let (base, seen) = canned_server(vec![head.clone(), recent]).await;
+        let net = HttpNet::with_bases(reqwest::Client::new(), None, &base, &base)
+            .with_interval(Duration::ZERO);
+        let v = net.cve_probe("cpe:2.3:a:x:y").await.unwrap();
+        assert_eq!(v["totalResults"], 40);
+        assert_eq!(v["vulnerabilities"][0]["cve"]["id"], "CVE-2026-2");
+        let lines = seen.lock().unwrap().clone();
+        assert!(lines[0].contains("resultsPerPage=1 "), "{lines:?}");
+        assert!(lines[1].contains("pubStartDate=") && lines[1].contains("pubEndDate="));
+
+        // Empty window: falls back to the last page (startIndex = total - 5).
+        let last = r#"{"totalResults":40,"vulnerabilities":[
+            {"cve":{"id":"CVE-2012-9","published":"2012-01-01T00:00:00.000"}}]}"#
+            .to_owned();
+        let empty = r#"{"totalResults":0,"vulnerabilities":[]}"#.to_owned();
+        let (base, seen) = canned_server(vec![head, empty, last]).await;
+        let net = HttpNet::with_bases(reqwest::Client::new(), None, &base, &base)
+            .with_interval(Duration::ZERO);
+        let v = net.cve_probe("cpe:2.3:a:x:y").await.unwrap();
+        assert_eq!(v["vulnerabilities"][0]["cve"]["id"], "CVE-2012-9");
+        assert!(seen.lock().unwrap()[2].contains("startIndex=35"));
     }
 
     #[test]
